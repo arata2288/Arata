@@ -1,0 +1,18 @@
+{
+  "name": "scrum-plane-bot",
+  "version": "0.1.0",
+  "description": "Telegram-бот, который понимает русский язык, ставит задачи в Plane и присматривает за сервисами через Claude AI",
+  "main": "src/bot.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/bot.js",
+    "setup": "node src/setup.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "better-sqlite3": "^11.5.0",
+    "dotenv": "^16.4.5",
+    "node-cron": "^3.0.3",
+    "telegraf": "^4.16.3"
+  }
+}
