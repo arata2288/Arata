@@ -17,13 +17,11 @@ const TIMEOUT_MS = 10_000;
  * на пустых URL.
  */
 function _services() {
-    // Self-check: бот стучится в свой же health-endpoint.
-    // На Railway PORT задаётся динамически, локально fallback на 3000.
-    const selfUrl = process.env.BOT_SERVER_URL
-        || `http://localhost:${process.env.PORT || 3000}/health`;
-
+    // Bot Server self-check намеренно убран:
+    // — это циклическая проверка (если бот мёртв, он и алерт не пошлёт);
+    // — Railway сам пингует /health через healthcheckPath и автоперезапустит при падении.
     return [
-        // Plane проверяем только если ЕСТЬ И URL, И API-ключ — иначе нет смысла.
+        // Plane проверяем только если ЕСТЬ И URL, И API-ключ.
         process.env.PLANE_URL && process.env.PLANE_API_KEY && {
             name: 'Plane API',
             url: `${process.env.PLANE_URL.replace(/\/$/, '')}/api/v1/`,
@@ -42,7 +40,6 @@ function _services() {
             url: `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/getMe`,
             headers: {},
         },
-        { name: 'Bot Server', url: selfUrl, headers: {} },
     ].filter(Boolean);
 }
 
