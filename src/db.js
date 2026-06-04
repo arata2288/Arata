@@ -84,3 +84,25 @@ export function loadHistory(chatId, limit = 10) {
     ).all(chatId, limit);
     return rows.reverse();
 }
+
+/** Удалить всю историю одного чата (команда /forget). Возвращает число удалённых строк. */
+export function clearHistory(chatId) {
+    const result = db.prepare(
+        'DELETE FROM dialog_history WHERE tg_user_id = ?',
+    ).run(chatId);
+    return result.changes;
+}
+
+/** Сводная статистика по dialog_history — для команды /stats. */
+export function stats() {
+    return db.prepare(`
+        SELECT
+            COUNT(*)                                                          AS total_messages,
+            COUNT(DISTINCT tg_user_id)                                        AS unique_chats,
+            (SELECT COUNT(*) FROM dialog_history WHERE role = 'user')         AS user_messages,
+            (SELECT COUNT(*) FROM dialog_history WHERE role = 'assistant')    AS assistant_messages,
+            (SELECT created_at FROM dialog_history ORDER BY id ASC  LIMIT 1)  AS first_message_at,
+            (SELECT created_at FROM dialog_history ORDER BY id DESC LIMIT 1)  AS last_message_at
+        FROM dialog_history
+    `).get();
+}
