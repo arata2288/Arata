@@ -74,7 +74,7 @@ export async function analyzeTask(userMessage, history = []) {
             };
         }
     } catch (err) {
-        console.error('[claude] analyzeTask error:', err.message);
+        console.error('[claude] analyzeTask error:', err.message, '| cause:', err.cause?.code, err.cause?.message, '| status:', err.status);
         return null;
     }
 }
@@ -100,7 +100,7 @@ export async function analyzeError(serviceName, httpStatus, responseTime) {
         });
         return response.content?.[0]?.text?.trim() || null;
     } catch (err) {
-        console.error('[claude] analyzeError error:', err.message);
+        console.error('[claude] analyzeError error:', err.message, '| cause:', err.cause?.code, err.cause?.message, '| status:', err.status);
         return null;
     }
 }
