@@ -75,38 +75,64 @@ export async function checkService(name, url, headers = {}) {
     }
 }
 
+// Запоминаем последний статус каждого сервиса. Алерт уходит только при СМЕНЕ статуса
+// (ok → fail или fail → ok), а не каждые 5 минут, пока сервис лежит.
+const _lastStatus = new Map();
+
 /**
  * Проверяет все сервисы из _services().
- * Если передан botInstance — шлёт алерт в ALERT_CHAT_ID при каждом сбое
- * (с AI-объяснением от Claude).
+ * Защита от шума:
+ *   1. Если первая попытка упала — ждём 3 сек и пробуем ещё раз (фильтр транзитных блипов).
+ *   2. Алерт уходит только если статус ИЗМЕНИЛСЯ относительно прошлого опроса.
  */
 export async function checkAll(botInstance = null) {
     const services = _services();
     const results = [];
 
     for (const svc of services) {
-        const result = await checkService(svc.name, svc.url, svc.headers);
+        let result = await checkService(svc.name, svc.url, svc.headers);
+
+        // Retry: транзитный блип за 3 сек обычно проходит.
+        if (result.status !== 'ok') {
+            await new Promise((r) => setTimeout(r, 3000));
+            result = await checkService(svc.name, svc.url, svc.headers);
+        }
         results.push(result);
 
-        if (result.status === 'ok') continue;
-        // Куда слать: сначала из БД (выбрано через /set_alert), иначе fallback на .env.
+        const currentStatus = result.status === 'ok' ? 'ok' : 'fail';
+        const previousStatus = _lastStatus.get(svc.name);
+        _lastStatus.set(svc.name, currentStatus);
+
         const alertChatId = getAlertChatId() || process.env.ALERT_CHAT_ID;
         if (!botInstance || !alertChatId) continue;
 
-        // Сервис не отвечает — формируем алерт.
-        const aiHint = await analyzeError(result.name, result.httpCode, result.responseTime);
-        const text = [
-            `🔴 ${result.name}`,
-            `📍 ${result.httpCode || result.error || 'нет ответа'}`,
-            `⏱ ${result.responseTime} мс`,
-            `🕐 ${new Date().toLocaleString('ru-RU')}`,
-            aiHint ? `\n${aiHint}` : null,
-        ].filter(Boolean).join('\n');
+        // Алерт о падении — только при смене ok → fail (или при первом наблюдении как fail).
+        if (currentStatus === 'fail' && previousStatus !== 'fail') {
+            const aiHint = await analyzeError(result.name, result.httpCode, result.responseTime);
+            const text = [
+                `🔴 ${result.name}`,
+                `📍 ${result.httpCode || result.error || 'нет ответа'}`,
+                `⏱ ${result.responseTime} мс`,
+                `🕐 ${new Date().toLocaleString('ru-RU')}`,
+                aiHint ? `\n${aiHint}` : null,
+            ].filter(Boolean).join('\n');
+            try {
+                await botInstance.telegram.sendMessage(alertChatId, text);
+            } catch (err) {
+                console.error('[healthcheck] не удалось отправить алерт:', err.message);
+            }
+        }
 
-        try {
-            await botInstance.telegram.sendMessage(alertChatId, text);
-        } catch (err) {
-            console.error('[healthcheck] не удалось отправить алерт:', err.message);
+        // Алерт о восстановлении — при fail → ok.
+        if (currentStatus === 'ok' && previousStatus === 'fail') {
+            try {
+                await botInstance.telegram.sendMessage(
+                    alertChatId,
+                    `✅ ${result.name}: восстановился (${result.responseTime} мс).`,
+                );
+            } catch (err) {
+                console.error('[healthcheck] не удалось отправить recovery-алерт:', err.message);
+            }
         }
     }
     return results;
