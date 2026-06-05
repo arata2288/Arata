@@ -15,6 +15,9 @@ import {
     loadHistory,
     clearHistory,
     stats as dbStats,
+    addMonitoredService,
+    listMonitoredServices,
+    removeMonitoredService,
 } from './db.js';
 import { runManualCheck, startScheduler } from './healthcheck.js';
 
@@ -89,6 +92,7 @@ async function cmdHelp(ctx) {
             '/menu — показать клавиатуру с кнопками.',
             '/status — быстрый health-check сервисов.',
             '/services — детальный список мониторимых сервисов.',
+            '/monitor — добавить/удалить свой сервис для мониторинга.',
             '/stats — статистика бота (uptime, сообщения, чаты).',
             '/forget — очистить историю этого чата.',
             '/set_alert — присылать алерты от мониторинга в этот чат.',
@@ -155,6 +159,65 @@ async function cmdForget(ctx) {
     await ctx.reply(`🔇 История очищена. Удалено сообщений: ${removed}.\nТеперь я начинаю наш диалог «с чистого листа».`);
 }
 
+async function cmdMonitor(ctx) {
+    const parts = ctx.message.text.trim().split(/\s+/);
+    const sub = (parts[1] || '').toLowerCase();
+
+    if (sub === 'add') {
+        const name = parts[2];
+        const url = parts[3];
+        if (!name || !url) {
+            await ctx.reply('Использование: /monitor add <имя> <url>\nПример: /monitor add MySite https://mysite.com');
+            return;
+        }
+        if (!/^https?:\/\//.test(url)) {
+            await ctx.reply('URL должен начинаться с http:// или https://');
+            return;
+        }
+        addMonitoredService(name, url);
+        await ctx.reply(
+            `✅ Добавлен сервис «${name}» → ${url}\nБуду проверять каждые 5 мин. Если упадёт — пришлю алерт с AI-разбором сюда.`,
+        );
+        return;
+    }
+
+    if (sub === 'list' || sub === 'ls') {
+        const items = listMonitoredServices();
+        if (items.length === 0) {
+            await ctx.reply('Своих сервисов пока нет.\nДобавить: /monitor add <имя> <url>');
+            return;
+        }
+        const lines = items.map((s) => `• ${s.name} — ${s.url}`);
+        await ctx.reply(['Ваши сервисы на мониторинге:', ...lines].join('\n'));
+        return;
+    }
+
+    if (sub === 'remove' || sub === 'rm' || sub === 'delete' || sub === 'del') {
+        const name = parts[2];
+        if (!name) {
+            await ctx.reply('Использование: /monitor remove <имя>');
+            return;
+        }
+        const n = removeMonitoredService(name);
+        if (n === 0) {
+            await ctx.reply(`Сервис «${name}» не найден. Список: /monitor list`);
+            return;
+        }
+        await ctx.reply(`🗑 Удалён «${name}». Больше не мониторится.`);
+        return;
+    }
+
+    await ctx.reply(
+        [
+            '/monitor — мониторинг своих сервисов:',
+            '',
+            '/monitor add <имя> <url> — добавить',
+            '/monitor list — показать все',
+            '/monitor remove <имя> — удалить',
+        ].join('\n'),
+    );
+}
+
 async function cmdSetAlert(ctx) {
     const chatId = ctx.chat.id;
     setAlertChatId(chatId);
@@ -188,6 +251,7 @@ bot.command('services',  (ctx) => safeCmd(ctx, cmdServices));
 bot.command('stats',     (ctx) => safeCmd(ctx, cmdStats));
 bot.command('forget',    (ctx) => safeCmd(ctx, cmdForget));
 bot.command('set_alert', (ctx) => safeCmd(ctx, cmdSetAlert));
+bot.command('monitor',   (ctx) => safeCmd(ctx, cmdMonitor));
 
 // =================== Кнопки меню (распознаём по тексту) ===================
 const BUTTON_HANDLERS = {

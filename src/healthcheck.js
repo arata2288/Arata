@@ -5,7 +5,7 @@ import cron from 'node-cron';
 import dotenv from 'dotenv';
 
 import { analyzeError } from './claude.js';
-import { getAlertChatId } from './db.js';
+import { getAlertChatId, listMonitoredServices } from './db.js';
 
 dotenv.config();
 
@@ -20,8 +20,9 @@ function _services() {
     // Bot Server self-check намеренно убран:
     // — это циклическая проверка (если бот мёртв, он и алерт не пошлёт);
     // — Railway сам пингует /health через healthcheckPath и автоперезапустит при падении.
-    return [
-        // Plane проверяем только если ЕСТЬ И URL, И API-ключ.
+
+    // 1. Системные зависимости (всегда чекаются).
+    const builtin = [
         process.env.PLANE_URL && process.env.PLANE_API_KEY && {
             name: 'Plane API',
             url: `${process.env.PLANE_URL.replace(/\/$/, '')}/api/v1/`,
@@ -41,6 +42,18 @@ function _services() {
             headers: {},
         },
     ].filter(Boolean);
+
+    // 2. Пользовательские сервисы из SQLite (добавляются через /monitor add).
+    let custom = [];
+    try {
+        custom = listMonitoredServices().map((s) => ({
+            name: s.name, url: s.url, headers: {},
+        }));
+    } catch (err) {
+        console.error('[healthcheck] не смог прочитать пользовательские сервисы:', err.message);
+    }
+
+    return [...builtin, ...custom];
 }
 
 /**

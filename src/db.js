@@ -41,6 +41,13 @@ export function ensureSchema() {
             updated_at TEXT    NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS monitored_services (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            name     TEXT    UNIQUE NOT NULL,
+            url      TEXT    NOT NULL,
+            added_at TEXT    NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_tasks_user  ON tasks(tg_user_id);
         CREATE INDEX IF NOT EXISTS idx_dialog_user ON dialog_history(tg_user_id);
     `);
@@ -91,6 +98,26 @@ export function clearHistory(chatId) {
         'DELETE FROM dialog_history WHERE tg_user_id = ?',
     ).run(chatId);
     return result.changes;
+}
+
+/** Добавить (или обновить) пользовательский сервис в мониторинг. */
+export function addMonitoredService(name, url) {
+    db.prepare(
+        `INSERT INTO monitored_services (name, url, added_at) VALUES (?, ?, ?)
+         ON CONFLICT(name) DO UPDATE SET url = excluded.url, added_at = excluded.added_at`,
+    ).run(name, url, new Date().toISOString());
+}
+
+/** Список всех пользовательских сервисов на мониторинге. */
+export function listMonitoredServices() {
+    return db.prepare(
+        'SELECT name, url, added_at FROM monitored_services ORDER BY id',
+    ).all();
+}
+
+/** Удалить сервис по имени. Возвращает число удалённых строк. */
+export function removeMonitoredService(name) {
+    return db.prepare('DELETE FROM monitored_services WHERE name = ?').run(name).changes;
 }
 
 /** Сводная статистика по dialog_history — для команды /stats. */
