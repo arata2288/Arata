@@ -31,9 +31,31 @@ ensureSchema();
 
 const HISTORY_LIMIT = 10;
 const START_TIME = Date.now();
+const MAX_USER_MESSAGE_LEN = 2000; // обрезаем длинные сообщения перед записью/Claude
+const PENDING_TTL_MS = 30 * 60 * 1000; // 30 мин на подтверждение задачи
 
-// Подтверждение создания задачи (userId → план)
+// Подтверждение создания задачи (userId → план с createdAt)
 const pendingTasks = new Map();
+
+// Периодическая чистка просроченных pendingTasks (раз в 5 мин).
+setInterval(() => {
+    const cutoff = Date.now() - PENDING_TTL_MS;
+    for (const [userId, entry] of pendingTasks) {
+        if (entry.createdAt < cutoff) pendingTasks.delete(userId);
+    }
+}, 5 * 60 * 1000);
+
+// Обёртка для команд: глушит исключения внутри, отвечает пользователю про сбой.
+async function safeCmd(ctx, fn) {
+    try {
+        await fn(ctx);
+    } catch (err) {
+        console.error('[cmd] internal error:', err.message);
+        try {
+            await ctx.reply('⚠️ Внутренняя ошибка. Попробуйте ещё раз через минуту.');
+        } catch { /* если не смогли ответить — отдельный лог уже выше */ }
+    }
+}
 
 // =================== Клавиатура меню ===================
 const MENU_KEYBOARD = Markup.keyboard([
@@ -158,14 +180,14 @@ async function cmdListTasks(ctx) {
     await ctx.reply(`Текущие задачи (топ 10):\n${list}`);
 }
 
-// =================== Регистрация команд ===================
-bot.command('help', cmdHelp);
-bot.command('menu', cmdMenu);
-bot.command('status', cmdStatus);
-bot.command('services', cmdServices);
-bot.command('stats', cmdStats);
-bot.command('forget', cmdForget);
-bot.command('set_alert', cmdSetAlert);
+// =================== Регистрация команд (обёрнуты в safeCmd) ===================
+bot.command('help',      (ctx) => safeCmd(ctx, cmdHelp));
+bot.command('menu',      (ctx) => safeCmd(ctx, cmdMenu));
+bot.command('status',    (ctx) => safeCmd(ctx, cmdStatus));
+bot.command('services',  (ctx) => safeCmd(ctx, cmdServices));
+bot.command('stats',     (ctx) => safeCmd(ctx, cmdStats));
+bot.command('forget',    (ctx) => safeCmd(ctx, cmdForget));
+bot.command('set_alert', (ctx) => safeCmd(ctx, cmdSetAlert));
 
 // =================== Кнопки меню (распознаём по тексту) ===================
 const BUTTON_HANDLERS = {
@@ -178,33 +200,46 @@ const BUTTON_HANDLERS = {
 
 // =================== Подтверждение создания задач ===================
 bot.action('confirm_create', async (ctx) => {
-    const userId = ctx.from.id;
-    const plan = pendingTasks.get(userId);
-    if (!plan) {
-        await ctx.answerCbQuery('Задача неактуальна');
-        return;
-    }
-    pendingTasks.delete(userId);
-    await ctx.answerCbQuery('Создаю...');
-
-    const assigneeId = plan.assignee ? await resolveAssignee(plan.assignee) : null;
-    const created = await createIssue(plan.title, plan.description, plan.priority, assigneeId);
-
-    if (!created) {
-        await ctx.editMessageText('❌ Plane API не ответил — задача не создана. Проверьте логи и .env.');
-        return;
-    }
-
     try {
-        db.prepare(
-            'INSERT INTO tasks (tg_user_id, plane_issue_key, created_at) VALUES (?, ?, ?)',
-        ).run(userId, created.id || created.sequence_id || '', new Date().toISOString());
-    } catch {
-        /* tasks таблицы нет — не критично */
-    }
+        const userId = ctx.from.id;
+        const plan = pendingTasks.get(userId);
 
-    const url = `${process.env.PLANE_URL?.replace(/\/$/, '')}/${process.env.PLANE_WORKSPACE_SLUG}/projects/${process.env.PLANE_PROJECT_ID}/issues/${created.id}`;
-    await ctx.editMessageText(`✅ Создано: ${created.name}\n${url}`);
+        // Проверка TTL: задача могла протухнуть.
+        if (!plan || Date.now() - plan.createdAt > PENDING_TTL_MS) {
+            pendingTasks.delete(userId);
+            await ctx.answerCbQuery('Задача неактуальна');
+            return;
+        }
+        pendingTasks.delete(userId);
+        await ctx.answerCbQuery('Создаю...');
+
+        const assigneeId = plan.assignee ? await resolveAssignee(plan.assignee) : null;
+        const created = await createIssue(plan.title, plan.description, plan.priority, assigneeId);
+
+        if (!created) {
+            await ctx.editMessageText('❌ Plane API не ответил — задача не создана. Проверьте логи и .env.');
+            return;
+        }
+
+        try {
+            db.prepare(
+                'INSERT INTO tasks (tg_user_id, plane_issue_key, created_at) VALUES (?, ?, ?)',
+            ).run(userId, created.id || created.sequence_id || '', new Date().toISOString());
+        } catch {
+            /* таблицы tasks нет — не критично */
+        }
+
+        // Показываем ссылку только если все переменные Plane заданы.
+        const baseUrl = process.env.PLANE_URL?.replace(/\/$/, '');
+        const slug = process.env.PLANE_WORKSPACE_SLUG;
+        const projectId = process.env.PLANE_PROJECT_ID;
+        const url = baseUrl && slug && projectId
+            ? `\n${baseUrl}/${slug}/projects/${projectId}/issues/${created.id}`
+            : '';
+        await ctx.editMessageText(`✅ Создано: ${created.name}${url}`);
+    } catch (err) {
+        console.error('[confirm_create] error:', err.message);
+    }
 });
 
 bot.action('cancel_create', async (ctx) => {
@@ -214,9 +249,11 @@ bot.action('cancel_create', async (ctx) => {
 });
 
 // =================== Основной обработчик текста ===================
-bot.on('text', async (ctx) => {
+bot.on('text', (ctx) => safeCmd(ctx, async (ctx) => {
     const chatId = ctx.chat.id;
-    const message = ctx.message.text;
+    const rawMessage = ctx.message.text;
+    // Обрезаем длинные сообщения, чтобы не раздувать БД и контекст Claude.
+    const message = rawMessage.slice(0, MAX_USER_MESSAGE_LEN);
 
     // 1. Если нажата кнопка меню — выполняем сразу, не зовём Claude.
     const handler = BUTTON_HANDLERS[message];
@@ -242,6 +279,7 @@ bot.on('text', async (ctx) => {
             assignee: result.assignee,
             priority: result.priority || 'medium',
             dueDate: result.dueDate,
+            createdAt: Date.now(),
         });
         const preview = [
             'Создать задачу?',
@@ -274,11 +312,11 @@ bot.on('text', async (ctx) => {
     }
 
     await ctx.reply(result.reply || 'Принято.');
-});
+}));
 
 // =================== HTTP self-healthcheck ===================
 const HEALTH_PORT = Number(process.env.PORT) || 3000;
-http.createServer((req, res) => {
+const httpServer = http.createServer((req, res) => {
     if (req.url === '/health') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ status: 'ok', service: 'scrum-plane-bot' }));
@@ -289,8 +327,16 @@ http.createServer((req, res) => {
 
 // =================== Старт ===================
 startScheduler(bot);
-bot.launch();
+bot.launch().catch((err) => {
+    console.error('[telegraf] launch error:', err.message);
+    // HTTP-сервер всё равно живёт — Railway healthcheck не упадёт зря.
+});
 console.log('Бот запущен');
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+function gracefulShutdown(signal) {
+    console.log(`[shutdown] получен сигнал ${signal}`);
+    bot.stop(signal);
+    httpServer.close();
+}
+process.once('SIGINT', () => gracefulShutdown('SIGINT'));
+process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));

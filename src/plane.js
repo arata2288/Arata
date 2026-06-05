@@ -15,7 +15,8 @@ const {
 
 function _projectPath() {
     if (!PLANE_URL || !PLANE_WORKSPACE_SLUG || !PLANE_PROJECT_ID) {
-        throw new Error('Plane: не заданы PLANE_URL / PLANE_WORKSPACE_SLUG / PLANE_PROJECT_ID');
+        console.warn('[plane] не заданы PLANE_URL / WORKSPACE_SLUG / PROJECT_ID — функция вернёт null');
+        return null;
     }
     return `${PLANE_URL.replace(/\/$/, '')}/api/v1/workspaces/${PLANE_WORKSPACE_SLUG}/projects/${PLANE_PROJECT_ID}`;
 }
@@ -50,13 +51,15 @@ async function _request(method, url, body = null) {
  * @returns объект созданной задачи или null при ошибке.
  */
 export async function createIssue(title, description, priority = 'none', assigneeId = null) {
+    const base = _projectPath();
+    if (!base) return null;
     const payload = {
         name: title,
         description_html: description ? `<p>${description}</p>` : undefined,
         priority, // 'urgent' | 'high' | 'medium' | 'low' | 'none'
         assignees: assigneeId ? [assigneeId] : [],
     };
-    return _request('POST', `${_projectPath()}/issues/`, payload);
+    return _request('POST', `${base}/issues/`, payload);
 }
 
 /**
@@ -64,14 +67,15 @@ export async function createIssue(title, description, priority = 'none', assigne
  * filters: { state?, priority?, assignee? } — будут переданы как query-параметры.
  */
 export async function getIssues(filters = {}) {
+    const base = _projectPath();
+    if (!base) return null;
     const params = new URLSearchParams();
     for (const [key, value] of Object.entries(filters)) {
         if (value !== undefined && value !== null) params.set(key, value);
     }
     const qs = params.toString();
-    const url = `${_projectPath()}/issues/${qs ? '?' + qs : ''}`;
+    const url = `${base}/issues/${qs ? '?' + qs : ''}`;
     const data = await _request('GET', url);
-    // Plane может вернуть либо массив, либо {results: [...]} в зависимости от версии — нормализуем.
     if (!data) return null;
     return Array.isArray(data) ? data : (data.results || []);
 }
@@ -81,7 +85,9 @@ export async function getIssues(filters = {}) {
  * fields: произвольный набор полей Plane Issue (state, priority, assignees, target_date, ...).
  */
 export async function updateIssue(issueId, fields) {
-    return _request('PATCH', `${_projectPath()}/issues/${issueId}/`, fields);
+    const base = _projectPath();
+    if (!base) return null;
+    return _request('PATCH', `${base}/issues/${issueId}/`, fields);
 }
 
 /**

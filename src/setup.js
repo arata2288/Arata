@@ -1,21 +1,26 @@
 // Запуск: `node src/setup.js` или `npm run setup`.
-// 1. Проверяет, что все переменные .env заполнены.
-// 2. Открывает SQLite, создаёт таблицы tasks и dialog_history (если их нет).
-// 3. По каждому пункту печатает ✅ или ❌ с подсказкой, что исправить.
+// 1. Проверяет обязательные переменные .env (без них бот не стартует).
+// 2. Предупреждает о опциональных, которые не заданы (Plane скипнется, и т.д.).
+// 3. Открывает SQLite и создаёт все таблицы через ensureSchema().
+// 4. По каждому пункту печатает ✅ / ⚠️ / ❌ с подсказкой, что делать.
 
 import dotenv from 'dotenv';
-import { db } from './db.js';
+
+import { db, ensureSchema } from './db.js';
 
 dotenv.config();
 
+// Без этих переменных бот не запустится.
 const REQUIRED_VARS = [
     'TELEGRAM_BOT_TOKEN',
-    'ALERT_CHAT_ID',
-    'PLANE_URL',
-    'PLANE_API_KEY',
-    'PLANE_WORKSPACE_SLUG',
-    'PLANE_PROJECT_ID',
     'ANTHROPIC_API_KEY',
+];
+
+// Эти не обязательны: либо есть дефолты, либо просто фича отключится.
+const OPTIONAL_VARS = [
+    'ANTHROPIC_MODEL',
+    'DB_PATH',
+    'PLANE_URL', 'PLANE_API_KEY', 'PLANE_WORKSPACE_SLUG', 'PLANE_PROJECT_ID',
 ];
 
 let hasErrors = false;
@@ -26,12 +31,21 @@ function check(label, ok, hint = '') {
     if (!ok) hasErrors = true;
 }
 
-console.log('=== Проверка переменных окружения ===');
+console.log('=== Обязательные переменные ===');
 for (const name of REQUIRED_VARS) {
     check(name, Boolean(process.env[name]), 'не заполнено в .env');
 }
 
-console.log('\n=== Подключение к SQLite ===');
+console.log('\n=== Опциональные (без них фичи просто отключатся) ===');
+for (const name of OPTIONAL_VARS) {
+    if (process.env[name]) {
+        console.log(`✅ ${name}`);
+    } else {
+        console.log(`⚠️  ${name} — не задано (это ок, фича скипнется)`);
+    }
+}
+
+console.log('\n=== SQLite ===');
 try {
     db.prepare('SELECT 1').get();
     check('Подключение к bot.db', true);
@@ -39,35 +53,16 @@ try {
     check('Подключение к bot.db', false, err.message);
 }
 
-console.log('\n=== Создание таблиц ===');
 try {
-    db.exec(`
-        CREATE TABLE IF NOT EXISTS tasks (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            tg_user_id      INTEGER NOT NULL,
-            plane_issue_key TEXT    NOT NULL,
-            created_at      TEXT    NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS dialog_history (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            tg_user_id   INTEGER NOT NULL,
-            role         TEXT    NOT NULL,
-            content      TEXT    NOT NULL,
-            created_at   TEXT    NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(tg_user_id);
-        CREATE INDEX IF NOT EXISTS idx_dialog_user ON dialog_history(tg_user_id);
-    `);
-    check('Таблицы tasks, dialog_history', true);
+    ensureSchema();
+    check('Таблицы tasks, dialog_history, alert_chat', true);
 } catch (err) {
-    check('Таблицы tasks, dialog_history', false, err.message);
+    check('Создание таблиц', false, err.message);
 }
 
 console.log('\n=== Итог ===');
 if (hasErrors) {
-    console.log('❌ Есть незаполненные пункты. Откройте .env и заполните недостающее, затем повторите.');
+    console.log('❌ Есть критичные проблемы — бот не запустится. Поправьте .env и повторите.');
     process.exit(1);
 } else {
     console.log('✅ Всё готово. Можно запускать: npm start');
