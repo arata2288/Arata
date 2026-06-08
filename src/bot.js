@@ -11,6 +11,7 @@ import {
     db,
     ensureSchema,
     setAlertChatId,
+    getAlertChatId,
     saveMessage,
     loadHistory,
     clearHistory,
@@ -513,16 +514,128 @@ bot.on('text', (ctx) => safeCmd(ctx, async (ctx) => {
     await ctx.reply(result.reply || 'Принято.');
 }));
 
-// =================== HTTP self-healthcheck ===================
+// =================== HTTP: /health + /webhook ===================
 const HEALTH_PORT = Number(process.env.PORT) || 3000;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || null;
+const MAX_WEBHOOK_BODY = 100 * 1024; // 100 KB лимит на тело — защита от мусора
+
+function escapeHtml(s) {
+    return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
+function formatGitHub(payload, event) {
+    const repo = payload.repository?.full_name || payload.repository?.name || '?';
+    if (event === 'push') {
+        const ref = (payload.ref || '').replace('refs/heads/', '');
+        const author = payload.head_commit?.author?.name || payload.pusher?.name || '?';
+        const msg = payload.head_commit?.message || '(no message)';
+        const url = payload.compare || '';
+        return [
+            `📦 <b>GitHub push</b> — ${escapeHtml(repo)}`,
+            `Branch: <code>${escapeHtml(ref)}</code>`,
+            `Author: ${escapeHtml(author)}`,
+            `Msg: ${escapeHtml(msg.slice(0, 200))}`,
+            url ? `<a href="${escapeHtml(url)}">Diff</a>` : null,
+        ].filter(Boolean).join('\n');
+    }
+    if (event === 'pull_request') {
+        const pr = payload.pull_request || {};
+        return [
+            `🔀 <b>GitHub PR ${escapeHtml(payload.action || '')}</b> — ${escapeHtml(repo)}`,
+            `#${pr.number}: ${escapeHtml(pr.title || '')}`,
+            `Author: ${escapeHtml(pr.user?.login || '?')}`,
+            pr.html_url ? `<a href="${escapeHtml(pr.html_url)}">Открыть PR</a>` : null,
+        ].filter(Boolean).join('\n');
+    }
+    if (event === 'issues') {
+        const issue = payload.issue || {};
+        return [
+            `📝 <b>GitHub issue ${escapeHtml(payload.action || '')}</b> — ${escapeHtml(repo)}`,
+            `#${issue.number}: ${escapeHtml(issue.title || '')}`,
+            issue.html_url ? `<a href="${escapeHtml(issue.html_url)}">Открыть</a>` : null,
+        ].filter(Boolean).join('\n');
+    }
+    if (event === 'ping') {
+        return `🏓 <b>GitHub webhook ping</b> — ${escapeHtml(repo)}\nВсё подключено корректно.`;
+    }
+    // Прочие события — короткий дамп.
+    return `📡 <b>GitHub ${escapeHtml(event)}</b> — ${escapeHtml(repo)}`;
+}
+
+function formatGeneric(payload) {
+    const json = JSON.stringify(payload, null, 2);
+    const truncated = json.length > 2000 ? json.slice(0, 2000) + '\n…(обрезано)' : json;
+    return `📡 <b>Webhook</b>\n<pre>${escapeHtml(truncated)}</pre>`;
+}
+
+function formatWebhook(payload, headers) {
+    if (headers['x-github-event']) {
+        return formatGitHub(payload, headers['x-github-event']);
+    }
+    return formatGeneric(payload);
+}
+
+async function handleWebhook(req, res) {
+    if (!WEBHOOK_SECRET) {
+        res.writeHead(503).end('webhook disabled (set WEBHOOK_SECRET)');
+        return;
+    }
+    const secret = req.url.slice('/webhook/'.length).split('?')[0];
+    if (secret !== WEBHOOK_SECRET) {
+        res.writeHead(401).end('invalid secret');
+        return;
+    }
+    let body = '';
+    let aborted = false;
+    req.on('data', (chunk) => {
+        body += chunk;
+        if (body.length > MAX_WEBHOOK_BODY) {
+            aborted = true;
+            res.writeHead(413).end('body too large');
+            req.destroy();
+        }
+    });
+    req.on('end', async () => {
+        if (aborted) return;
+        try {
+            const payload = body ? JSON.parse(body) : {};
+            const text = formatWebhook(payload, req.headers);
+            const chatId = getAlertChatId() || process.env.ALERT_CHAT_ID;
+            if (!chatId) {
+                console.warn('[webhook] не задан чат — выполните /set_alert в Telegram');
+                res.writeHead(503).end('no alert chat — run /set_alert in Telegram');
+                return;
+            }
+            await bot.telegram.sendMessage(chatId, text, {
+                parse_mode: 'HTML',
+                disable_web_page_preview: true,
+            });
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true }));
+        } catch (err) {
+            console.error('[webhook] error:', err.message);
+            res.writeHead(500).end(`error: ${err.message}`);
+        }
+    });
+}
+
 const httpServer = http.createServer((req, res) => {
     if (req.url === '/health') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ status: 'ok', service: 'scrum-plane-bot' }));
-    } else {
-        res.writeHead(404).end();
+        return;
     }
-}).listen(HEALTH_PORT, () => console.log(`Health endpoint на :${HEALTH_PORT}/health`));
+    if (req.method === 'POST' && req.url.startsWith('/webhook/')) {
+        handleWebhook(req, res);
+        return;
+    }
+    res.writeHead(404).end();
+}).listen(HEALTH_PORT, () => {
+    console.log(`HTTP на :${HEALTH_PORT} (endpoints: /health, /webhook/<secret>)`);
+});
 
 // =================== Старт ===================
 startScheduler(bot);
