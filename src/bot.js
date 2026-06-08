@@ -18,6 +18,10 @@ import {
     addMonitoredService,
     listMonitoredServices,
     removeMonitoredService,
+    isAllowedUser,
+    addAllowedUser,
+    removeAllowedUser,
+    listAllowedUsers,
 } from './db.js';
 import { runManualCheck, startScheduler } from './healthcheck.js';
 
@@ -31,6 +35,45 @@ if (!token) {
 
 const bot = new Telegraf(token);
 ensureSchema();
+
+// =================== Whitelist ===================
+// Если ADMIN_USER_ID задан — бот приватный. Без него — открыт всем (старое поведение).
+const ADMIN_USER_ID = process.env.ADMIN_USER_ID ? Number(process.env.ADMIN_USER_ID) : null;
+const WHITELIST_ENABLED = ADMIN_USER_ID !== null && !Number.isNaN(ADMIN_USER_ID);
+
+function isAdmin(ctx) {
+    return WHITELIST_ENABLED && ctx.from?.id === ADMIN_USER_ID;
+}
+
+function canTalkToBot(ctx) {
+    if (!WHITELIST_ENABLED) return true;       // whitelist выключен — все пускаемся
+    if (isAdmin(ctx)) return true;             // админ всегда может
+    return isAllowedUser(ctx.from?.id);        // остальные — только если в БД
+}
+
+// Глобальный middleware-фильтр: блокирует всё, кроме /myid и /start, не-разрешённым.
+bot.use(async (ctx, next) => {
+    const text = ctx.message?.text || '';
+    if (text === '/myid' || text === '/start') return next();
+    if (canTalkToBot(ctx)) return next();
+
+    try {
+        if (ctx.callbackQuery) {
+            await ctx.answerCbQuery('🔒 Бот приватный');
+        } else if (ctx.message) {
+            await ctx.reply(
+                `🔒 Бот приватный.\nВаш ID: ${ctx.from?.id}\nПопросите админа выполнить: /allow ${ctx.from?.id}`,
+            );
+        }
+    } catch { /* проигнорировать */ }
+    // не вызываем next() — на этом обработка останавливается
+});
+
+if (WHITELIST_ENABLED) {
+    console.log(`[whitelist] активен. Админ: ${ADMIN_USER_ID}`);
+} else {
+    console.warn('[whitelist] ВЫКЛЮЧЕН. Задайте ADMIN_USER_ID в env, чтобы сделать бота приватным.');
+}
 
 const HISTORY_LIMIT = 10;
 const START_TIME = Date.now();
@@ -96,7 +139,11 @@ async function cmdHelp(ctx) {
             '/stats — статистика бота (uptime, сообщения, чаты).',
             '/forget — очистить историю этого чата.',
             '/set_alert — присылать алерты от мониторинга в этот чат.',
+            '/myid — показать ваш Telegram ID и статус доступа.',
             '/help — это сообщение.',
+            '',
+            'Для админа (если whitelist активен):',
+            '/allow <id>, /disallow <id>, /allowed — управление доступом.',
         ].join('\n'),
         MENU_KEYBOARD,
     );
@@ -157,6 +204,90 @@ async function cmdStats(ctx) {
 async function cmdForget(ctx) {
     const removed = clearHistory(ctx.chat.id);
     await ctx.reply(`🔇 История очищена. Удалено сообщений: ${removed}.\nТеперь я начинаю наш диалог «с чистого листа».`);
+}
+
+async function cmdMyId(ctx) {
+    const id = ctx.from?.id;
+    const username = ctx.from?.username ? `@${ctx.from.username}` : '(нет username)';
+    const lines = [
+        `Ваш Telegram ID: <code>${id}</code>`,
+        `Username: ${username}`,
+        '',
+    ];
+    if (!WHITELIST_ENABLED) {
+        lines.push('🔓 Whitelist выключен — бот сейчас доступен всем.');
+    } else if (isAdmin(ctx)) {
+        lines.push('👑 Вы админ бота.');
+    } else if (isAllowedUser(id)) {
+        lines.push('✅ Вы в whitelist, бот вам доступен.');
+    } else {
+        lines.push('🔒 Вас нет в whitelist. Попросите админа: <code>/allow ' + id + '</code>');
+    }
+    await ctx.reply(lines.join('\n'), { parse_mode: 'HTML' });
+}
+
+async function cmdAllow(ctx) {
+    if (!WHITELIST_ENABLED) {
+        await ctx.reply('⚠️ Whitelist выключен (ADMIN_USER_ID не задан в env).');
+        return;
+    }
+    if (!isAdmin(ctx)) {
+        await ctx.reply('🔒 Команда доступна только админу.');
+        return;
+    }
+    const parts = ctx.message.text.trim().split(/\s+/);
+    const userId = Number(parts[1]);
+    if (!userId) {
+        await ctx.reply('Использование: /allow <telegram_user_id>');
+        return;
+    }
+    addAllowedUser(userId, null, ctx.from.id);
+    await ctx.reply(`✅ User ${userId} добавлен в whitelist.`);
+}
+
+async function cmdDisallow(ctx) {
+    if (!WHITELIST_ENABLED) {
+        await ctx.reply('⚠️ Whitelist выключен (ADMIN_USER_ID не задан в env).');
+        return;
+    }
+    if (!isAdmin(ctx)) {
+        await ctx.reply('🔒 Команда доступна только админу.');
+        return;
+    }
+    const parts = ctx.message.text.trim().split(/\s+/);
+    const userId = Number(parts[1]);
+    if (!userId) {
+        await ctx.reply('Использование: /disallow <telegram_user_id>');
+        return;
+    }
+    const n = removeAllowedUser(userId);
+    if (n === 0) {
+        await ctx.reply(`User ${userId} не в whitelist.`);
+        return;
+    }
+    await ctx.reply(`🗑 User ${userId} удалён из whitelist.`);
+}
+
+async function cmdAllowed(ctx) {
+    if (!WHITELIST_ENABLED) {
+        await ctx.reply('⚠️ Whitelist выключен (ADMIN_USER_ID не задан в env).');
+        return;
+    }
+    if (!isAdmin(ctx)) {
+        await ctx.reply('🔒 Команда доступна только админу.');
+        return;
+    }
+    const list = listAllowedUsers();
+    const lines = [`👑 Админ: ${ADMIN_USER_ID}`];
+    if (list.length === 0) {
+        lines.push('Whitelist пуст. Только админ имеет доступ.');
+    } else {
+        lines.push('Дополнительно разрешены:');
+        for (const u of list) {
+            lines.push(`• ${u.tg_user_id}${u.username ? ` (@${u.username})` : ''}`);
+        }
+    }
+    await ctx.reply(lines.join('\n'));
 }
 
 async function cmdMonitor(ctx) {
@@ -252,6 +383,10 @@ bot.command('stats',     (ctx) => safeCmd(ctx, cmdStats));
 bot.command('forget',    (ctx) => safeCmd(ctx, cmdForget));
 bot.command('set_alert', (ctx) => safeCmd(ctx, cmdSetAlert));
 bot.command('monitor',   (ctx) => safeCmd(ctx, cmdMonitor));
+bot.command('myid',      (ctx) => safeCmd(ctx, cmdMyId));
+bot.command('allow',     (ctx) => safeCmd(ctx, cmdAllow));
+bot.command('disallow',  (ctx) => safeCmd(ctx, cmdDisallow));
+bot.command('allowed',   (ctx) => safeCmd(ctx, cmdAllowed));
 
 // =================== Кнопки меню (распознаём по тексту) ===================
 const BUTTON_HANDLERS = {

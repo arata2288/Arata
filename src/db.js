@@ -48,6 +48,13 @@ export function ensureSchema() {
             added_at TEXT    NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS allowed_users (
+            tg_user_id INTEGER PRIMARY KEY,
+            username   TEXT,
+            added_at   TEXT NOT NULL,
+            added_by   INTEGER
+        );
+
         CREATE INDEX IF NOT EXISTS idx_tasks_user  ON tasks(tg_user_id);
         CREATE INDEX IF NOT EXISTS idx_dialog_user ON dialog_history(tg_user_id);
     `);
@@ -118,6 +125,36 @@ export function listMonitoredServices() {
 /** Удалить сервис по имени. Возвращает число удалённых строк. */
 export function removeMonitoredService(name) {
     return db.prepare('DELETE FROM monitored_services WHERE name = ?').run(name).changes;
+}
+
+/** Whitelist: проверить, разрешён ли пользователь. */
+export function isAllowedUser(userId) {
+    if (!userId) return false;
+    const row = db.prepare('SELECT 1 FROM allowed_users WHERE tg_user_id = ?').get(userId);
+    return !!row;
+}
+
+/** Добавить пользователя в whitelist (UPSERT). */
+export function addAllowedUser(userId, username, addedBy) {
+    db.prepare(
+        `INSERT INTO allowed_users (tg_user_id, username, added_at, added_by)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(tg_user_id) DO UPDATE SET
+             username = excluded.username,
+             added_at = excluded.added_at`,
+    ).run(userId, username || null, new Date().toISOString(), addedBy || null);
+}
+
+/** Удалить пользователя из whitelist. Возвращает число удалённых строк. */
+export function removeAllowedUser(userId) {
+    return db.prepare('DELETE FROM allowed_users WHERE tg_user_id = ?').run(userId).changes;
+}
+
+/** Список разрешённых пользователей. */
+export function listAllowedUsers() {
+    return db.prepare(
+        'SELECT tg_user_id, username, added_at FROM allowed_users ORDER BY tg_user_id',
+    ).all();
 }
 
 /** Сводная статистика по dialog_history — для команды /stats. */
