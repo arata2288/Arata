@@ -99,6 +99,48 @@ export async function analyzeTask(userMessage, history = []) {
 
 
 /**
+ * Универсальная обёртка для простых текстовых запросов к Claude — для /translate, /summarize, /explain.
+ * Возвращает чистый текст без JSON-обёртки.
+ */
+async function _simpleCall(systemPrompt, userMessage, maxTokens = 1024) {
+    try {
+        const response = await client.messages.create({
+            model: MODEL,
+            max_tokens: maxTokens,
+            system: systemPrompt,
+            messages: [{ role: 'user', content: userMessage }],
+        });
+        return response.content?.[0]?.text?.trim() || null;
+    } catch (err) {
+        console.error(
+            '[claude] simple call error:',
+            JSON.stringify({ name: err.name, message: err.message, status: err.status }),
+        );
+        return null;
+    }
+}
+
+export async function translate(text, targetLang = null) {
+    const system = targetLang
+        ? `Переведи следующий текст на язык: ${targetLang}. Только перевод, без пояснений, без кавычек.`
+        : 'Определи язык текста и переведи на ПРОТИВОПОЛОЖНЫЙ (русский ↔ английский, или с другого языка на русский). '
+            + 'Только перевод, без пояснений, без кавычек.';
+    return _simpleCall(system, text, 1024);
+}
+
+export async function summarize(text) {
+    const system = 'Сделай краткое резюме текста на русском в 3-7 пунктов, каждый с символа «• ». '
+        + 'Только самую суть. Без воды, без вводных фраз, без markdown.';
+    return _simpleCall(system, text, 1024);
+}
+
+export async function explain(text) {
+    const system = 'Объясни на русском простыми словами что это (код, термин, концепция, regex, SQL, аббревиатура). '
+        + '3-7 предложений. Если это код — что он делает. Без markdown, без тройных кавычек.';
+    return _simpleCall(system, text, 1024);
+}
+
+/**
  * Объяснить сбой сервиса и предложить шаги диагностики.
  * @returns {Promise<string|null>} текст на русском или null при сбое.
  */

@@ -6,7 +6,7 @@ import { Telegraf, Markup } from 'telegraf';
 import cron from 'node-cron';
 import dotenv from 'dotenv';
 
-import { analyzeTask } from './claude.js';
+import { analyzeTask, translate, summarize, explain } from './claude.js';
 import { createIssue, getIssues, resolveAssignee } from './plane.js';
 import {
     db,
@@ -35,6 +35,10 @@ import {
     listUserReminders,
     markReminderSent,
     deleteReminder,
+    addNote,
+    listNotes,
+    getNote,
+    deleteNote,
 } from './db.js';
 import { runManualCheck, startScheduler } from './healthcheck.js';
 
@@ -149,8 +153,12 @@ async function cmdHelp(ctx) {
             '/status — быстрый health-check сервисов.',
             '/services — детальный список мониторимых сервисов.',
             '/monitor — добавить/удалить свой сервис для мониторинга.',
-            '/todo — личный список задач (add/list/done/delete).',
+            '/todo — личный список задач (add/list/done/edit/delete).',
             '/remind — напоминания (18:00 / через 30 мин / завтра 9:00).',
+            '/note — заметки (поддерживают многострочный текст).',
+            '/translate — перевод текста (русский ↔ английский или явный язык).',
+            '/summarize — краткое резюме длинного текста.',
+            '/explain — объяснить код, термин, регулярку, SQL простыми словами.',
             '/stats — статистика бота (uptime, сообщения, чаты).',
             '/forget — очистить историю этого чата.',
             '/set_alert — присылать алерты от мониторинга в этот чат.',
@@ -469,6 +477,158 @@ async function cmdRemind(ctx) {
     );
 }
 
+// =================== /translate, /summarize, /explain — обёртки над Claude ===================
+
+async function cmdTranslate(ctx) {
+    const fullText = ctx.message.text.replace(/^\/translate/i, '').trim();
+    if (!fullText) {
+        await ctx.reply(
+            '🌐 /translate — перевод текста\n\n'
+            + '/translate <текст> — авто (русский ↔ английский)\n'
+            + '/translate en <текст> — на английский\n'
+            + '/translate kk <текст> — на казахский\n'
+            + '/translate de <текст> — на немецкий\n'
+            + '...любой код или название языка',
+        );
+        return;
+    }
+
+    // Если первый токен — короткий буквенный код (2-5 латинских букв), считаем его lang code.
+    const m = fullText.match(/^([a-z]{2,5})\s+([\s\S]+)$/i);
+    let targetLang = null;
+    let textToTranslate = fullText;
+    if (m) {
+        targetLang = m[1].toLowerCase();
+        textToTranslate = m[2];
+    }
+
+    await ctx.sendChatAction('typing').catch(() => {});
+    const result = await translate(textToTranslate, targetLang);
+    if (!result) {
+        await ctx.reply('Не получилось перевести (Claude API не ответил).');
+        return;
+    }
+    await ctx.reply(`🌐 ${result}`);
+}
+
+async function cmdSummarize(ctx) {
+    const text = ctx.message.text.replace(/^\/summarize/i, '').trim();
+    if (!text) {
+        await ctx.reply(
+            '📝 /summarize <текст> — краткое резюме\n\n'
+            + 'Вставьте после команды длинный текст (статью, документ, переписку) — '
+            + 'бот вернёт 3-7 пунктов с самой сутью.',
+        );
+        return;
+    }
+    await ctx.sendChatAction('typing').catch(() => {});
+    const result = await summarize(text);
+    if (!result) {
+        await ctx.reply('Не получилось сделать резюме (Claude API не ответил).');
+        return;
+    }
+    await ctx.reply(`📝 Резюме:\n\n${result}`);
+}
+
+async function cmdExplain(ctx) {
+    const text = ctx.message.text.replace(/^\/explain/i, '').trim();
+    if (!text) {
+        await ctx.reply(
+            '💡 /explain <что-то> — объяснить простыми словами\n\n'
+            + 'Можно: код, термин, regex, SQL-запрос, аббревиатура, концепция.\n\n'
+            + 'Примеры:\n'
+            + '/explain SELECT * FROM users WHERE id = 1\n'
+            + '/explain что такое closure\n'
+            + '/explain ^\\d{3}-\\d{2}-\\d{4}$',
+        );
+        return;
+    }
+    await ctx.sendChatAction('typing').catch(() => {});
+    const result = await explain(text);
+    if (!result) {
+        await ctx.reply('Не получилось объяснить (Claude API не ответил).');
+        return;
+    }
+    await ctx.reply(`💡 ${result}`);
+}
+
+// =================== /note — личные заметки ===================
+
+async function cmdNote(ctx) {
+    const userId = ctx.from.id;
+    const parts = ctx.message.text.trim().split(/\s+/);
+    const sub = (parts[1] || '').toLowerCase();
+
+    if (sub === 'add') {
+        // Для заметок поддерживаем многострочный текст — не режем по \n.
+        const fullText = ctx.message.text.replace(/^\/note\s+add\s+/i, '').trim();
+        if (!fullText) {
+            await ctx.reply('Использование: /note add <текст заметки>');
+            return;
+        }
+        const id = addNote(userId, fullText);
+        await ctx.reply(`✅ Заметка #${id} сохранена.`);
+        return;
+    }
+
+    if (sub === 'list' || sub === '') {
+        const notes = listNotes(userId);
+        if (notes.length === 0) {
+            await ctx.reply('Заметок нет.\nДобавить: /note add <текст>');
+            return;
+        }
+        const lines = notes.map((n) => {
+            const date = new Date(n.created_at).toLocaleDateString('ru-RU');
+            const preview = n.text.length > 100
+                ? n.text.slice(0, 100).replace(/\n/g, ' ') + '…'
+                : n.text.replace(/\n/g, ' ');
+            return `📌 #${n.id}  ${date}\n${preview}`;
+        });
+        await ctx.reply(['📚 Ваши заметки:', '', ...lines].join('\n\n'));
+        return;
+    }
+
+    if (sub === 'show') {
+        const id = Number(parts[2]);
+        if (!id) {
+            await ctx.reply('Использование: /note show <id>');
+            return;
+        }
+        const note = getNote(userId, id);
+        if (!note) {
+            await ctx.reply(`Заметка #${id} не найдена.`);
+            return;
+        }
+        const date = new Date(note.created_at).toLocaleString('ru-RU');
+        await ctx.reply(`📌 #${id}  ${date}\n\n${note.text}`);
+        return;
+    }
+
+    if (sub === 'delete' || sub === 'del' || sub === 'rm') {
+        const id = Number(parts[2]);
+        if (!id) {
+            await ctx.reply('Использование: /note delete <id>');
+            return;
+        }
+        const n = deleteNote(userId, id);
+        if (n === 0) {
+            await ctx.reply(`Заметка #${id} не найдена.`);
+            return;
+        }
+        await ctx.reply(`🗑 Заметка #${id} удалена.`);
+        return;
+    }
+
+    await ctx.reply([
+        '📚 /note — личные заметки',
+        '',
+        '/note add <текст> — добавить (поддерживается многострочный текст)',
+        '/note list — все заметки с превью',
+        '/note show <id> — показать заметку целиком',
+        '/note delete <id> — удалить',
+    ].join('\n'));
+}
+
 async function cmdMyId(ctx) {
     const id = ctx.from?.id;
     const username = ctx.from?.username ? `@${ctx.from.username}` : '(нет username)';
@@ -648,6 +808,10 @@ bot.command('set_alert', (ctx) => safeCmd(ctx, cmdSetAlert));
 bot.command('monitor',   (ctx) => safeCmd(ctx, cmdMonitor));
 bot.command('todo',      (ctx) => safeCmd(ctx, cmdTodo));
 bot.command('remind',    (ctx) => safeCmd(ctx, cmdRemind));
+bot.command('note',      (ctx) => safeCmd(ctx, cmdNote));
+bot.command('translate', (ctx) => safeCmd(ctx, cmdTranslate));
+bot.command('summarize', (ctx) => safeCmd(ctx, cmdSummarize));
+bot.command('explain',   (ctx) => safeCmd(ctx, cmdExplain));
 bot.command('myid',      (ctx) => safeCmd(ctx, cmdMyId));
 bot.command('allow',     (ctx) => safeCmd(ctx, cmdAllow));
 bot.command('disallow',  (ctx) => safeCmd(ctx, cmdDisallow));

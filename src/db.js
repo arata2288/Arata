@@ -74,10 +74,18 @@ export function ensureSchema() {
             sent       INTEGER NOT NULL DEFAULT 0
         );
 
+        CREATE TABLE IF NOT EXISTS notes (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            tg_user_id INTEGER NOT NULL,
+            text       TEXT    NOT NULL,
+            created_at TEXT    NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_tasks_user     ON tasks(tg_user_id);
         CREATE INDEX IF NOT EXISTS idx_dialog_user    ON dialog_history(tg_user_id);
         CREATE INDEX IF NOT EXISTS idx_todos_user     ON todos(tg_user_id, status);
         CREATE INDEX IF NOT EXISTS idx_reminders_due  ON reminders(sent, remind_at);
+        CREATE INDEX IF NOT EXISTS idx_notes_user     ON notes(tg_user_id);
     `);
 }
 
@@ -263,6 +271,33 @@ export function markReminderSent(id) {
 export function deleteReminder(userId, id) {
     return db.prepare(
         'DELETE FROM reminders WHERE id = ? AND tg_user_id = ?',
+    ).run(id, userId).changes;
+}
+
+// ============================== Notes ==============================
+
+export function addNote(userId, text) {
+    const result = db.prepare(
+        'INSERT INTO notes (tg_user_id, text, created_at) VALUES (?, ?, ?)',
+    ).run(userId, text, new Date().toISOString());
+    return result.lastInsertRowid;
+}
+
+export function listNotes(userId) {
+    return db.prepare(
+        'SELECT id, text, created_at FROM notes WHERE tg_user_id = ? ORDER BY id DESC',
+    ).all(userId);
+}
+
+export function getNote(userId, id) {
+    return db.prepare(
+        'SELECT id, text, created_at FROM notes WHERE id = ? AND tg_user_id = ?',
+    ).get(id, userId);
+}
+
+export function deleteNote(userId, id) {
+    return db.prepare(
+        'DELETE FROM notes WHERE id = ? AND tg_user_id = ?',
     ).run(id, userId).changes;
 }
 
