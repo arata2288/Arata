@@ -29,6 +29,7 @@ import {
     listAllTodos,
     markTodoDone,
     deleteTodo,
+    editTodo,
     addReminder,
     listPendingReminders,
     listUserReminders,
@@ -227,13 +228,40 @@ async function cmdTodo(ctx) {
     const sub = (parts[1] || '').toLowerCase();
 
     if (sub === 'add') {
-        const text = ctx.message.text.replace(/^\/todo\s+add\s+/i, '').trim();
+        // Берём только первую строку, чтобы случайный многострочный ввод
+        // (несколько /todo add подряд в одном сообщении) не залил мусор.
+        const firstLine = ctx.message.text.split('\n')[0];
+        const text = firstLine.replace(/^\/todo\s+add\s+/i, '').trim();
         if (!text) {
             await ctx.reply('Использование: /todo add <текст задачи>');
             return;
         }
         const id = addTodo(userId, text);
         await ctx.reply(`✅ Добавлено #${id}: ${text}`);
+        return;
+    }
+
+    if (sub === 'edit') {
+        const id = Number(parts[2]);
+        if (!id) {
+            await ctx.reply('Использование: /todo edit <id> <новый текст>');
+            return;
+        }
+        // Текст после "/todo edit <id> " — только первая строка.
+        const firstLine = ctx.message.text.split('\n')[0];
+        const newText = firstLine
+            .replace(/^\/todo\s+edit\s+\d+\s+/i, '')
+            .trim();
+        if (!newText) {
+            await ctx.reply('Использование: /todo edit <id> <новый текст>');
+            return;
+        }
+        const n = editTodo(userId, id, newText);
+        if (n === 0) {
+            await ctx.reply(`Задача #${id} не найдена.`);
+            return;
+        }
+        await ctx.reply(`✏️ Задача #${id} обновлена: ${newText}`);
         return;
     }
 
@@ -298,7 +326,10 @@ async function cmdTodo(ctx) {
         '/todo list — открытые (по умолчанию)',
         '/todo all — все, включая выполненные',
         '/todo done <id> — отметить выполненной',
+        '/todo edit <id> <новый текст> — изменить',
         '/todo delete <id> — удалить',
+        '',
+        '⚠️ В /todo add отправляйте по одной задаче за сообщение.',
     ].join('\n'));
 }
 

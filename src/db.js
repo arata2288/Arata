@@ -219,6 +219,12 @@ export function deleteTodo(userId, id) {
     ).run(id, userId).changes;
 }
 
+export function editTodo(userId, id, newText) {
+    return db.prepare(
+        'UPDATE todos SET text = ? WHERE id = ? AND tg_user_id = ?',
+    ).run(newText, id, userId).changes;
+}
+
 // ============================== Reminders ==============================
 
 export function addReminder(userId, chatId, text, remindAt) {
