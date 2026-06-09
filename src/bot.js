@@ -3,6 +3,7 @@
 
 import http from 'node:http';
 import { Telegraf, Markup } from 'telegraf';
+import cron from 'node-cron';
 import dotenv from 'dotenv';
 
 import { analyzeTask } from './claude.js';
@@ -23,6 +24,16 @@ import {
     addAllowedUser,
     removeAllowedUser,
     listAllowedUsers,
+    addTodo,
+    listTodos,
+    listAllTodos,
+    markTodoDone,
+    deleteTodo,
+    addReminder,
+    listPendingReminders,
+    listUserReminders,
+    markReminderSent,
+    deleteReminder,
 } from './db.js';
 import { runManualCheck, startScheduler } from './healthcheck.js';
 
@@ -137,6 +148,8 @@ async function cmdHelp(ctx) {
             '/status — быстрый health-check сервисов.',
             '/services — детальный список мониторимых сервисов.',
             '/monitor — добавить/удалить свой сервис для мониторинга.',
+            '/todo — личный список задач (add/list/done/delete).',
+            '/remind — напоминания (18:00 / через 30 мин / завтра 9:00).',
             '/stats — статистика бота (uptime, сообщения, чаты).',
             '/forget — очистить историю этого чата.',
             '/set_alert — присылать алерты от мониторинга в этот чат.',
@@ -205,6 +218,224 @@ async function cmdStats(ctx) {
 async function cmdForget(ctx) {
     const removed = clearHistory(ctx.chat.id);
     await ctx.reply(`🔇 История очищена. Удалено сообщений: ${removed}.\nТеперь я начинаю наш диалог «с чистого листа».`);
+}
+
+// =================== /todo ===================
+async function cmdTodo(ctx) {
+    const userId = ctx.from.id;
+    const parts = ctx.message.text.trim().split(/\s+/);
+    const sub = (parts[1] || '').toLowerCase();
+
+    if (sub === 'add') {
+        const text = ctx.message.text.replace(/^\/todo\s+add\s+/i, '').trim();
+        if (!text) {
+            await ctx.reply('Использование: /todo add <текст задачи>');
+            return;
+        }
+        const id = addTodo(userId, text);
+        await ctx.reply(`✅ Добавлено #${id}: ${text}`);
+        return;
+    }
+
+    if (sub === 'list' || sub === '') {
+        const todos = listTodos(userId, 'open');
+        if (todos.length === 0) {
+            await ctx.reply('Открытых задач нет.\nДобавить: /todo add <текст>');
+            return;
+        }
+        const lines = todos.map((t) => `⬜ #${t.id}  ${t.text}`);
+        await ctx.reply(['📋 Ваши задачи:', '', ...lines].join('\n'));
+        return;
+    }
+
+    if (sub === 'all') {
+        const todos = listAllTodos(userId);
+        if (todos.length === 0) {
+            await ctx.reply('Задач нет.');
+            return;
+        }
+        const lines = todos.map((t) =>
+            `${t.status === 'done' ? '✅' : '⬜'} #${t.id}  ${t.text}`,
+        );
+        await ctx.reply(['📋 Все задачи:', '', ...lines].join('\n'));
+        return;
+    }
+
+    if (sub === 'done') {
+        const id = Number(parts[2]);
+        if (!id) {
+            await ctx.reply('Использование: /todo done <id>');
+            return;
+        }
+        const n = markTodoDone(userId, id);
+        if (n === 0) {
+            await ctx.reply(`Задача #${id} не найдена или уже выполнена.`);
+            return;
+        }
+        await ctx.reply(`✅ Задача #${id} выполнена.`);
+        return;
+    }
+
+    if (sub === 'delete' || sub === 'del' || sub === 'rm') {
+        const id = Number(parts[2]);
+        if (!id) {
+            await ctx.reply('Использование: /todo delete <id>');
+            return;
+        }
+        const n = deleteTodo(userId, id);
+        if (n === 0) {
+            await ctx.reply(`Задача #${id} не найдена.`);
+            return;
+        }
+        await ctx.reply(`🗑 Задача #${id} удалена.`);
+        return;
+    }
+
+    await ctx.reply([
+        '📋 /todo — личный список задач',
+        '',
+        '/todo add <текст> — добавить',
+        '/todo list — открытые (по умолчанию)',
+        '/todo all — все, включая выполненные',
+        '/todo done <id> — отметить выполненной',
+        '/todo delete <id> — удалить',
+    ].join('\n'));
+}
+
+// =================== /remind: парсер времени ===================
+// Возвращает {date, text} либо null.
+// Понимает: "HH:MM текст", "завтра HH:MM текст",
+//            "через N мин|минут|минуту|минуты текст",
+//            "через N час|часа|часов|часу текст",
+//            "через N день|дня|дней|дн текст".
+function parseRemind(input) {
+    const text = input.trim();
+    if (!text) return null;
+    const now = new Date();
+    let m;
+    let timePart = null;
+    let date = null;
+
+    // \b плохо работает с кириллицей в JS-regex, поэтому используем (?=\s|$).
+
+    // через N минут
+    m = text.match(/^через\s+(\d+)\s*(минут[ауы]?|мин)(?=\s|$)/i);
+    if (m) {
+        timePart = m[0];
+        date = new Date(now.getTime() + Number(m[1]) * 60_000);
+    }
+    // через N часов
+    if (!date) {
+        m = text.match(/^через\s+(\d+)\s*(час(?:ов|а|у)?)(?=\s|$)/i);
+        if (m) {
+            timePart = m[0];
+            date = new Date(now.getTime() + Number(m[1]) * 3_600_000);
+        }
+    }
+    // через N дней
+    if (!date) {
+        m = text.match(/^через\s+(\d+)\s*(день|дня|дней|дн)(?=\s|$)/i);
+        if (m) {
+            timePart = m[0];
+            date = new Date(now.getTime() + Number(m[1]) * 86_400_000);
+        }
+    }
+    // завтра HH:MM
+    if (!date) {
+        m = text.match(/^завтра\s+(\d{1,2}):(\d{2})(?=\s|$)/i);
+        if (m) {
+            timePart = m[0];
+            date = new Date();
+            date.setDate(date.getDate() + 1);
+            date.setHours(Number(m[1]), Number(m[2]), 0, 0);
+        }
+    }
+    // HH:MM (сегодня или завтра, если прошло)
+    if (!date) {
+        m = text.match(/^(\d{1,2}):(\d{2})(?=\s|$)/);
+        if (m) {
+            timePart = m[0];
+            date = new Date();
+            date.setHours(Number(m[1]), Number(m[2]), 0, 0);
+            if (date <= now) date.setDate(date.getDate() + 1);
+        }
+    }
+
+    if (!date) return null;
+    const body = text.slice(timePart.length).trim();
+    if (!body) return null;
+    return { date, text: body };
+}
+
+async function cmdRemind(ctx) {
+    const userId = ctx.from.id;
+    const chatId = ctx.chat.id;
+    const fullText = ctx.message.text.replace(/^\/remind/i, '').trim();
+    const parts = fullText.split(/\s+/);
+    const sub = (parts[0] || '').toLowerCase();
+
+    if (sub === 'list') {
+        const items = listUserReminders(userId);
+        if (items.length === 0) {
+            await ctx.reply('Активных напоминаний нет.');
+            return;
+        }
+        const lines = items.map((r) =>
+            `#${r.id}  ${new Date(r.remind_at).toLocaleString('ru-RU')}\n   ${r.text}`,
+        );
+        await ctx.reply(['⏰ Ваши напоминания:', '', ...lines].join('\n'));
+        return;
+    }
+
+    if (sub === 'delete' || sub === 'del' || sub === 'rm') {
+        const id = Number(parts[1]);
+        if (!id) {
+            await ctx.reply('Использование: /remind delete <id>');
+            return;
+        }
+        const n = deleteReminder(userId, id);
+        if (n === 0) {
+            await ctx.reply(`Напоминание #${id} не найдено.`);
+            return;
+        }
+        await ctx.reply(`🗑 Напоминание #${id} удалено.`);
+        return;
+    }
+
+    // Без аргументов — помощь
+    if (!fullText) {
+        await ctx.reply([
+            '⏰ /remind — напоминания',
+            '',
+            'Примеры:',
+            '/remind 18:00 совещание',
+            '/remind через 30 мин позвонить врачу',
+            '/remind через 2 часа перерыв',
+            '/remind завтра 9:00 митинг',
+            '',
+            '/remind list — активные',
+            '/remind delete <id> — удалить',
+        ].join('\n'));
+        return;
+    }
+
+    // Парсинг времени
+    const parsed = parseRemind(fullText);
+    if (!parsed) {
+        await ctx.reply(
+            'Не понял время. Попробуйте формат:\n' +
+            '/remind 18:00 текст\n' +
+            '/remind через 30 мин текст\n' +
+            '/remind через 2 часа текст\n' +
+            '/remind завтра 9:00 текст',
+        );
+        return;
+    }
+
+    const id = addReminder(userId, chatId, parsed.text, parsed.date);
+    await ctx.reply(
+        `⏰ Напомню ${parsed.date.toLocaleString('ru-RU')}\n#${id}: ${parsed.text}`,
+    );
 }
 
 async function cmdMyId(ctx) {
@@ -384,6 +615,8 @@ bot.command('stats',     (ctx) => safeCmd(ctx, cmdStats));
 bot.command('forget',    (ctx) => safeCmd(ctx, cmdForget));
 bot.command('set_alert', (ctx) => safeCmd(ctx, cmdSetAlert));
 bot.command('monitor',   (ctx) => safeCmd(ctx, cmdMonitor));
+bot.command('todo',      (ctx) => safeCmd(ctx, cmdTodo));
+bot.command('remind',    (ctx) => safeCmd(ctx, cmdRemind));
 bot.command('myid',      (ctx) => safeCmd(ctx, cmdMyId));
 bot.command('allow',     (ctx) => safeCmd(ctx, cmdAllow));
 bot.command('disallow',  (ctx) => safeCmd(ctx, cmdDisallow));
@@ -635,6 +868,26 @@ const httpServer = http.createServer((req, res) => {
     res.writeHead(404).end();
 }).listen(HEALTH_PORT, () => {
     console.log(`HTTP на :${HEALTH_PORT} (endpoints: /health, /webhook/<secret>)`);
+});
+
+// =================== Cron напоминаний ===================
+// Каждую минуту проверяем reminders с remind_at <= сейчас и шлём их.
+cron.schedule('* * * * *', async () => {
+    let due;
+    try {
+        due = listPendingReminders();
+    } catch (err) {
+        console.error('[reminder] чтение из БД упало:', err.message);
+        return;
+    }
+    for (const r of due) {
+        try {
+            await bot.telegram.sendMessage(r.chat_id, `⏰ Напоминание #${r.id}:\n${r.text}`);
+            markReminderSent(r.id);
+        } catch (err) {
+            console.error(`[reminder] не отправил #${r.id}:`, err.message);
+        }
+    }
 });
 
 // =================== Старт ===================

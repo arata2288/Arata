@@ -55,8 +55,29 @@ export function ensureSchema() {
             added_by   INTEGER
         );
 
-        CREATE INDEX IF NOT EXISTS idx_tasks_user  ON tasks(tg_user_id);
-        CREATE INDEX IF NOT EXISTS idx_dialog_user ON dialog_history(tg_user_id);
+        CREATE TABLE IF NOT EXISTS todos (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            tg_user_id   INTEGER NOT NULL,
+            text         TEXT    NOT NULL,
+            status       TEXT    NOT NULL DEFAULT 'open',
+            created_at   TEXT    NOT NULL,
+            completed_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS reminders (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            tg_user_id INTEGER NOT NULL,
+            chat_id    INTEGER NOT NULL,
+            text       TEXT    NOT NULL,
+            remind_at  TEXT    NOT NULL,
+            created_at TEXT    NOT NULL,
+            sent       INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tasks_user     ON tasks(tg_user_id);
+        CREATE INDEX IF NOT EXISTS idx_dialog_user    ON dialog_history(tg_user_id);
+        CREATE INDEX IF NOT EXISTS idx_todos_user     ON todos(tg_user_id, status);
+        CREATE INDEX IF NOT EXISTS idx_reminders_due  ON reminders(sent, remind_at);
     `);
 }
 
@@ -155,6 +176,88 @@ export function listAllowedUsers() {
     return db.prepare(
         'SELECT tg_user_id, username, added_at FROM allowed_users ORDER BY tg_user_id',
     ).all();
+}
+
+// ============================== TODOs ==============================
+
+export function addTodo(userId, text) {
+    const result = db.prepare(
+        `INSERT INTO todos (tg_user_id, text, status, created_at)
+         VALUES (?, ?, 'open', ?)`,
+    ).run(userId, text, new Date().toISOString());
+    return result.lastInsertRowid;
+}
+
+export function listTodos(userId, status = 'open') {
+    return db.prepare(
+        `SELECT id, text, status, created_at, completed_at
+         FROM todos
+         WHERE tg_user_id = ? AND status = ?
+         ORDER BY id ASC`,
+    ).all(userId, status);
+}
+
+export function listAllTodos(userId) {
+    return db.prepare(
+        `SELECT id, text, status, created_at, completed_at
+         FROM todos
+         WHERE tg_user_id = ?
+         ORDER BY status ASC, id ASC`,
+    ).all(userId);
+}
+
+export function markTodoDone(userId, id) {
+    return db.prepare(
+        `UPDATE todos SET status = 'done', completed_at = ?
+         WHERE id = ? AND tg_user_id = ? AND status = 'open'`,
+    ).run(new Date().toISOString(), id, userId).changes;
+}
+
+export function deleteTodo(userId, id) {
+    return db.prepare(
+        'DELETE FROM todos WHERE id = ? AND tg_user_id = ?',
+    ).run(id, userId).changes;
+}
+
+// ============================== Reminders ==============================
+
+export function addReminder(userId, chatId, text, remindAt) {
+    const result = db.prepare(
+        `INSERT INTO reminders (tg_user_id, chat_id, text, remind_at, created_at, sent)
+         VALUES (?, ?, ?, ?, ?, 0)`,
+    ).run(userId, chatId, text, remindAt.toISOString(), new Date().toISOString());
+    return result.lastInsertRowid;
+}
+
+/** Все ещё не отправленные с remind_at <= сейчас. Используется cron'ом. */
+export function listPendingReminders() {
+    const nowIso = new Date().toISOString();
+    return db.prepare(
+        `SELECT id, tg_user_id, chat_id, text, remind_at
+         FROM reminders
+         WHERE sent = 0 AND remind_at <= ?
+         ORDER BY remind_at ASC`,
+    ).all(nowIso);
+}
+
+/** Список активных (ещё не отправленных) напоминаний юзера. */
+export function listUserReminders(userId) {
+    return db.prepare(
+        `SELECT id, text, remind_at
+         FROM reminders
+         WHERE tg_user_id = ? AND sent = 0
+         ORDER BY remind_at ASC`,
+    ).all(userId);
+}
+
+export function markReminderSent(id) {
+    return db.prepare('UPDATE reminders SET sent = 1 WHERE id = ?').run(id).changes;
+}
+
+export function deleteReminder(userId, id) {
+    return db.prepare(
+        'DELETE FROM reminders WHERE id = ? AND tg_user_id = ?',
+    ).run(id, userId).changes;
 }
 
 /** Сводная статистика по dialog_history — для команды /stats. */
