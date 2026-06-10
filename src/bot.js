@@ -8,6 +8,7 @@ import dotenv from 'dotenv';
 
 import { analyzeTask, translate, summarize, explain } from './claude.js';
 import { transcribeAudio, isVoiceEnabled } from './voice.js';
+import { synthesizeVoice, isTtsEnabled, TTS_MAX_CHARS } from './tts.js';
 import { createIssue, getIssues, resolveAssignee } from './plane.js';
 import {
     db,
@@ -163,7 +164,7 @@ async function cmdHelp(ctx) {
             '/explain — объяснить код, термин, регулярку, SQL простыми словами.',
             '/search <слово> — поиск по диалогам, задачам и заметкам.',
             '',
-            '🎤 Голосовые: запишите голосовое — бот его расшифрует и обработает как текст.',
+            '🎤 Голосовые: запишите голосовое — бот расшифрует, ответит текстом и (если есть ELEVENLABS_API_KEY) озвучит ответ.',
             '/stats — статистика бота (uptime, сообщения, чаты).',
             '/forget — очистить историю этого чата.',
             '/set_alert — присылать алерты от мониторинга в этот чат.',
@@ -1050,8 +1051,34 @@ async function handleVoice(ctx) {
     // Покажем, что услышали — полезно для прозрачности.
     await ctx.reply(`🎤 Услышал: «${transcript}»`);
 
-    // Пропускаем как обычное сообщение.
-    await processUserMessage(ctx, transcript);
+    // Перехватываем последний текстовый ответ бота — позже озвучим.
+    let lastTextReply = null;
+    const origReply = ctx.reply.bind(ctx);
+    ctx.reply = async (text, options) => {
+        const result = await origReply(text, options);
+        // Сохраняем только plain-text ответы без inline-клавиатуры.
+        if (typeof text === 'string' && !options?.reply_markup) {
+            lastTextReply = text;
+        }
+        return result;
+    };
+
+    try {
+        await processUserMessage(ctx, transcript);
+    } finally {
+        ctx.reply = origReply;
+    }
+
+    // Озвучиваем последний текстовый ответ (если он не слишком длинный).
+    if (isTtsEnabled() && lastTextReply && lastTextReply.length >= 5) {
+        try {
+            const audio = await synthesizeVoice(lastTextReply);
+            await ctx.replyWithVoice({ source: audio });
+        } catch (err) {
+            console.error('[tts]', err.message);
+            await origReply(`⚠️ Голосовой ответ не сгенерировался: ${err.message}`);
+        }
+    }
 }
 
 bot.on('voice', (ctx) => safeCmd(ctx, handleVoice));
