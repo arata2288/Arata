@@ -7,6 +7,7 @@ import cron from 'node-cron';
 import dotenv from 'dotenv';
 
 import { analyzeTask, translate, summarize, explain } from './claude.js';
+import { transcribeAudio, isVoiceEnabled } from './voice.js';
 import { createIssue, getIssues, resolveAssignee } from './plane.js';
 import {
     db,
@@ -161,6 +162,8 @@ async function cmdHelp(ctx) {
             '/summarize — краткое резюме длинного текста.',
             '/explain — объяснить код, термин, регулярку, SQL простыми словами.',
             '/search <слово> — поиск по диалогам, задачам и заметкам.',
+            '',
+            '🎤 Голосовые: запишите голосовое — бот его расшифрует и обработает как текст.',
             '/stats — статистика бота (uptime, сообщения, чаты).',
             '/forget — очистить историю этого чата.',
             '/set_alert — присылать алерты от мониторинга в этот чат.',
@@ -949,21 +952,19 @@ bot.action('cancel_create', async (ctx) => {
     await ctx.editMessageText('❌ Создание задачи отменено.');
 });
 
-// =================== Основной обработчик текста ===================
-bot.on('text', (ctx) => safeCmd(ctx, async (ctx) => {
+// =================== Универсальная обработка сообщения (текст ИЛИ транскрипт голосового) ===================
+async function processUserMessage(ctx, rawMessage) {
     const chatId = ctx.chat.id;
-    const rawMessage = ctx.message.text;
-    // Обрезаем длинные сообщения, чтобы не раздувать БД и контекст Claude.
     const message = rawMessage.slice(0, MAX_USER_MESSAGE_LEN);
 
-    // 1. Если нажата кнопка меню — выполняем сразу, не зовём Claude.
+    // 1. Если совпало с подписью кнопки меню — выполняем команду напрямую.
     const handler = BUTTON_HANDLERS[message];
     if (handler) {
         await handler(ctx);
         return;
     }
 
-    // 2. Обычное текстовое сообщение → понимаем через Claude.
+    // 2. Обычное сообщение → понимаем через Claude.
     saveMessage(chatId, 'user', message);
 
     const result = await analyzeTask(message, loadHistory(chatId, HISTORY_LIMIT));
@@ -1013,7 +1014,48 @@ bot.on('text', (ctx) => safeCmd(ctx, async (ctx) => {
     }
 
     await ctx.reply(result.reply || 'Принято.');
+}
+
+// Обработчик текстовых сообщений — просто оборачивает processUserMessage в safeCmd.
+bot.on('text', (ctx) => safeCmd(ctx, async (ctx) => {
+    await processUserMessage(ctx, ctx.message.text);
 }));
+
+// Обработчик голосовых и аудио — транскрибируем через Groq и пропускаем через тот же поток.
+async function handleVoice(ctx) {
+    const fileId = ctx.message.voice?.file_id || ctx.message.audio?.file_id;
+    if (!fileId) return;
+
+    if (!isVoiceEnabled()) {
+        await ctx.reply('🎤 Расшифровка голосовых отключена: не задан GROQ_API_KEY.');
+        return;
+    }
+
+    await ctx.sendChatAction('typing').catch(() => {});
+    let transcript;
+    try {
+        const link = await bot.telegram.getFileLink(fileId);
+        transcript = await transcribeAudio(link.toString());
+    } catch (err) {
+        console.error('[voice]', err.message);
+        await ctx.reply(`❌ Не получилось распознать голосовое: ${err.message}`);
+        return;
+    }
+
+    if (!transcript) {
+        await ctx.reply('🤔 Не услышал ничего — попробуйте записать ещё раз.');
+        return;
+    }
+
+    // Покажем, что услышали — полезно для прозрачности.
+    await ctx.reply(`🎤 Услышал: «${transcript}»`);
+
+    // Пропускаем как обычное сообщение.
+    await processUserMessage(ctx, transcript);
+}
+
+bot.on('voice', (ctx) => safeCmd(ctx, handleVoice));
+bot.on('audio', (ctx) => safeCmd(ctx, handleVoice));
 
 // =================== HTTP: /health + /webhook ===================
 const HEALTH_PORT = Number(process.env.PORT) || 3000;
