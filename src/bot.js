@@ -39,6 +39,7 @@ import {
     listNotes,
     getNote,
     deleteNote,
+    searchAcrossTables,
 } from './db.js';
 import { runManualCheck, startScheduler } from './healthcheck.js';
 
@@ -159,6 +160,7 @@ async function cmdHelp(ctx) {
             '/translate — перевод текста (русский ↔ английский или явный язык).',
             '/summarize — краткое резюме длинного текста.',
             '/explain — объяснить код, термин, регулярку, SQL простыми словами.',
+            '/search <слово> — поиск по диалогам, задачам и заметкам.',
             '/stats — статистика бота (uptime, сообщения, чаты).',
             '/forget — очистить историю этого чата.',
             '/set_alert — присылать алерты от мониторинга в этот чат.',
@@ -629,6 +631,76 @@ async function cmdNote(ctx) {
     ].join('\n'));
 }
 
+// =================== /search — поиск по диалогам, задачам, заметкам ===================
+
+function truncate(text, max = 80) {
+    const oneLine = text.replace(/\n/g, ' ');
+    return oneLine.length > max ? oneLine.slice(0, max) + '…' : oneLine;
+}
+
+async function cmdSearch(ctx) {
+    const query = ctx.message.text.replace(/^\/search/i, '').trim();
+    if (!query) {
+        await ctx.reply(
+            '🔍 /search <слово или фраза> — искать по диалогам, задачам и заметкам.\n\n'
+            + 'Примеры:\n'
+            + '/search молоко\n'
+            + '/search Биржан\n'
+            + '/search HR-портал',
+        );
+        return;
+    }
+    if (query.length < 2) {
+        await ctx.reply('Слишком короткий запрос — минимум 2 символа.');
+        return;
+    }
+
+    const userId = ctx.from.id;
+    const { dialogs, todos, notes } = searchAcrossTables(userId, query);
+    const total = dialogs.length + todos.length + notes.length;
+
+    if (total === 0) {
+        await ctx.reply(`🔍 По «${query}» ничего не найдено.`);
+        return;
+    }
+
+    const lines = [`🔍 Найдено ${total} совпадений по «${query}»`];
+
+    if (todos.length) {
+        lines.push('', `📋 Задачи (${todos.length}):`);
+        for (const t of todos.slice(0, 5)) {
+            const icon = t.status === 'done' ? '✅' : '⬜';
+            lines.push(`${icon} #${t.id}  ${truncate(t.text)}`);
+        }
+        if (todos.length > 5) lines.push(`   …и ещё ${todos.length - 5}`);
+    }
+
+    if (notes.length) {
+        lines.push('', `📚 Заметки (${notes.length}):`);
+        for (const n of notes.slice(0, 5)) {
+            const date = new Date(n.created_at).toLocaleDateString('ru-RU');
+            lines.push(`📌 #${n.id}  ${date}  ${truncate(n.text)}`);
+        }
+        if (notes.length > 5) lines.push(`   …и ещё ${notes.length - 5}`);
+    }
+
+    if (dialogs.length) {
+        lines.push('', `💬 История диалогов (${dialogs.length}):`);
+        for (const d of dialogs.slice(0, 5)) {
+            const date = new Date(d.created_at).toLocaleDateString('ru-RU');
+            const roleIcon = d.role === 'user' ? '👤' : '🤖';
+            lines.push(`${roleIcon} ${date}  ${truncate(d.content)}`);
+        }
+        if (dialogs.length > 5) lines.push(`   …и ещё ${dialogs.length - 5}`);
+    }
+
+    if (todos.length > 5 || notes.length > 5 || dialogs.length > 5) {
+        lines.push('', '💡 Уточните запрос, чтобы увидеть больше результатов.');
+    }
+
+    await ctx.reply(lines.join('\n'));
+}
+
 async function cmdMyId(ctx) {
     const id = ctx.from?.id;
     const username = ctx.from?.username ? `@${ctx.from.username}` : '(нет username)';
@@ -812,6 +884,7 @@ bot.command('note',      (ctx) => safeCmd(ctx, cmdNote));
 bot.command('translate', (ctx) => safeCmd(ctx, cmdTranslate));
 bot.command('summarize', (ctx) => safeCmd(ctx, cmdSummarize));
 bot.command('explain',   (ctx) => safeCmd(ctx, cmdExplain));
+bot.command('search',    (ctx) => safeCmd(ctx, cmdSearch));
 bot.command('myid',      (ctx) => safeCmd(ctx, cmdMyId));
 bot.command('allow',     (ctx) => safeCmd(ctx, cmdAllow));
 bot.command('disallow',  (ctx) => safeCmd(ctx, cmdDisallow));

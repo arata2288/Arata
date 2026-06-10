@@ -301,6 +301,41 @@ export function deleteNote(userId, id) {
     ).run(id, userId).changes;
 }
 
+// ============================== Search ==============================
+
+/**
+ * Поиск по диалогам, задачам и заметкам пользователя.
+ * Возвращает {dialogs: [...], todos: [...], notes: [...]}.
+ * Регистронезависимо, включая кириллицу (через JS toLowerCase).
+ */
+export function searchAcrossTables(userId, query) {
+    const q = query.toLowerCase();
+
+    const dialogs = db.prepare(
+        `SELECT id, role, content, created_at
+         FROM dialog_history
+         WHERE tg_user_id = ?
+         ORDER BY id DESC
+         LIMIT 1000`,
+    ).all(userId).filter((d) => d.content.toLowerCase().includes(q));
+
+    const todos = db.prepare(
+        `SELECT id, text, status, created_at
+         FROM todos
+         WHERE tg_user_id = ?
+         ORDER BY id ASC`,
+    ).all(userId).filter((t) => t.text.toLowerCase().includes(q));
+
+    const notes = db.prepare(
+        `SELECT id, text, created_at
+         FROM notes
+         WHERE tg_user_id = ?
+         ORDER BY id DESC`,
+    ).all(userId).filter((n) => n.text.toLowerCase().includes(q));
+
+    return { dialogs, todos, notes };
+}
+
 /** Сводная статистика по dialog_history — для команды /stats. */
 export function stats() {
     return db.prepare(`
