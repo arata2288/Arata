@@ -5,7 +5,8 @@ import cron from 'node-cron';
 import dotenv from 'dotenv';
 
 import { analyzeError } from './claude.js';
-import { getAlertChatId, listMonitoredServices } from './db.js';
+import { getAlertChatId, listMonitoredServices, getServiceStatus, setServiceStatus } from './db.js';
+import { logger } from './logger.js';
 
 dotenv.config();
 
@@ -50,7 +51,7 @@ function _services() {
             name: s.name, url: s.url, headers: {},
         }));
     } catch (err) {
-        console.error('[healthcheck] не смог прочитать пользовательские сервисы:', err.message);
+        logger.error({ err: err.message }, '[healthcheck] failed to read custom services');
     }
 
     return [...builtin, ...custom];
@@ -88,15 +89,12 @@ export async function checkService(name, url, headers = {}) {
     }
 }
 
-// Запоминаем последний статус каждого сервиса. Алерт уходит только при СМЕНЕ статуса
-// (ok → fail или fail → ok), а не каждые 5 минут, пока сервис лежит.
-const _lastStatus = new Map();
-
 /**
  * Проверяет все сервисы из _services().
  * Защита от шума:
  *   1. Если первая попытка упала — ждём 3 сек и пробуем ещё раз (фильтр транзитных блипов).
  *   2. Алерт уходит только если статус ИЗМЕНИЛСЯ относительно прошлого опроса.
+ * Последний статус хранится в SQLite (service_status), переживает рестарт.
  */
 export async function checkAll(botInstance = null) {
     const services = _services();
@@ -113,8 +111,8 @@ export async function checkAll(botInstance = null) {
         results.push(result);
 
         const currentStatus = result.status === 'ok' ? 'ok' : 'fail';
-        const previousStatus = _lastStatus.get(svc.name);
-        _lastStatus.set(svc.name, currentStatus);
+        const previousStatus = getServiceStatus(svc.name);
+        setServiceStatus(svc.name, currentStatus);
 
         const alertChatId = getAlertChatId() || process.env.ALERT_CHAT_ID;
         if (!botInstance || !alertChatId) continue;
@@ -132,7 +130,7 @@ export async function checkAll(botInstance = null) {
             try {
                 await botInstance.telegram.sendMessage(alertChatId, text);
             } catch (err) {
-                console.error('[healthcheck] не удалось отправить алерт:', err.message);
+                logger.error({ err: err.message }, '[healthcheck] failed to send alert');
             }
         }
 
@@ -144,7 +142,7 @@ export async function checkAll(botInstance = null) {
                     `✅ ${result.name}: восстановился (${result.responseTime} мс).`,
                 );
             } catch (err) {
-                console.error('[healthcheck] не удалось отправить recovery-алерт:', err.message);
+                logger.error({ err: err.message }, '[healthcheck] failed to send recovery alert');
             }
         }
     }
@@ -159,7 +157,7 @@ export async function runManualCheck() {
 /** Запустить cron, который каждые 5 минут вызывает checkAll(bot). */
 export function startScheduler(botInstance) {
     cron.schedule('*/5 * * * *', () => {
-        checkAll(botInstance).catch((err) => console.error('[healthcheck cron]', err));
+        checkAll(botInstance).catch((err) => logger.error({ err: err.message }, '[healthcheck cron] error'));
     });
-    console.log('[healthcheck] планировщик запущен (каждые 5 минут)');
+    logger.info('[healthcheck] scheduler started (every 5 min)');
 }

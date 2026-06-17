@@ -2,9 +2,12 @@
 // мониторит сервисы и отвечает на команды через Claude.
 
 import http from 'node:http';
+import { randomBytes } from 'node:crypto';
 import { Telegraf, Markup } from 'telegraf';
 import cron from 'node-cron';
 import dotenv from 'dotenv';
+
+import { logger } from './logger.js';
 
 import { analyzeTask, translate, summarize, explain } from './claude.js';
 import { transcribeAudio, isVoiceEnabled } from './voice.js';
@@ -42,6 +45,13 @@ import {
     getNote,
     deleteNote,
     searchAcrossTables,
+    checkAndRecordRateLimit,
+    savePendingTask,
+    getPendingTask,
+    deletePendingTask,
+    cleanupExpiredPendingTasks,
+    hasActivePendingTask,
+    cleanupDialogHistory,
 } from './db.js';
 import { runManualCheck, startScheduler } from './healthcheck.js';
 
@@ -49,12 +59,27 @@ dotenv.config();
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
-    console.error('TELEGRAM_BOT_TOKEN не задан в .env');
+    logger.error('TELEGRAM_BOT_TOKEN не задан в .env');
     process.exit(1);
 }
 
 const bot = new Telegraf(token);
 ensureSchema();
+
+// =================== DM-only middleware ===================
+// Бот работает только в приватных чатах. В групповых ctx.from.id !== ctx.chat.id,
+// что ломает унификацию tg_user_id в БД. Поэтому не пускаем.
+bot.use(async (ctx, next) => {
+    if (ctx.chat && ctx.chat.type !== 'private') {
+        if (ctx.chat.type === 'group' || ctx.chat.type === 'supergroup') {
+            try {
+                await ctx.reply('Этот бот работает только в личных сообщениях. Напишите мне в DM.');
+            } catch { /* проигнорировать */ }
+        }
+        return;
+    }
+    return next();
+});
 
 // =================== Whitelist ===================
 // Если ADMIN_USER_ID задан — бот приватный. Без него — открыт всем (старое поведение).
@@ -90,24 +115,25 @@ bot.use(async (ctx, next) => {
 });
 
 if (WHITELIST_ENABLED) {
-    console.log(`[whitelist] активен. Админ: ${ADMIN_USER_ID}`);
+    logger.info({ adminUserId: ADMIN_USER_ID }, 'whitelist enabled');
 } else {
-    console.warn('[whitelist] ВЫКЛЮЧЕН. Задайте ADMIN_USER_ID в env, чтобы сделать бота приватным.');
+    logger.warn('whitelist disabled — set ADMIN_USER_ID in env to enable');
 }
 
 const HISTORY_LIMIT = 10;
 const START_TIME = Date.now();
 const MAX_USER_MESSAGE_LEN = 2000; // обрезаем длинные сообщения перед записью/Claude
-const PENDING_TTL_MS = 30 * 60 * 1000; // 30 мин на подтверждение задачи
+const RATE_LIMIT_PER_HOUR = Number(process.env.RATE_LIMIT_PER_HOUR) || 30;
 
-// Подтверждение создания задачи (userId → план с createdAt)
-const pendingTasks = new Map();
-
-// Периодическая чистка просроченных pendingTasks (раз в 5 мин).
+// Pending-задачи (черновики ожидающие подтверждения) теперь живут в SQLite,
+// а не в in-memory Map. См. таблицу pending_tasks. Helpers — в db.js.
+// Чистка устаревших — раз в 5 мин ниже, при старте бота.
 setInterval(() => {
-    const cutoff = Date.now() - PENDING_TTL_MS;
-    for (const [userId, entry] of pendingTasks) {
-        if (entry.createdAt < cutoff) pendingTasks.delete(userId);
+    try {
+        const cleaned = cleanupExpiredPendingTasks();
+        if (cleaned > 0) logger.info({ cleaned }, 'cleaned expired pending tasks');
+    } catch (err) {
+        logger.error({ err: err.message }, 'failed to clean pending tasks');
     }
 }, 5 * 60 * 1000);
 
@@ -116,7 +142,7 @@ async function safeCmd(ctx, fn) {
     try {
         await fn(ctx);
     } catch (err) {
-        console.error('[cmd] internal error:', err.message);
+        logger.error({ err: err.message }, '[cmd] internal error');
         try {
             await ctx.reply('⚠️ Внутренняя ошибка. Попробуйте ещё раз через минуту.');
         } catch { /* если не смогли ответить — отдельный лог уже выше */ }
@@ -157,6 +183,7 @@ async function cmdHelp(ctx) {
             '/services — детальный список мониторимых сервисов.',
             '/monitor — добавить/удалить свой сервис для мониторинга.',
             '/todo — личный список задач (add/list/done/edit/delete).',
+            '/task <название> — создать задачу в Plane напрямую (без AI, аварийный режим).',
             '/remind — напоминания (18:00 / через 30 мин / завтра 9:00).',
             '/note — заметки (поддерживают многострочный текст).',
             '/translate — перевод текста (русский ↔ английский или явный язык).',
@@ -635,6 +662,46 @@ async function cmdNote(ctx) {
     ].join('\n'));
 }
 
+// =================== /task — fallback-команда: создать задачу в Plane напрямую без AI ===================
+
+async function cmdTask(ctx) {
+    const userId = ctx.from.id;
+    const raw = ctx.message.text.replace(/^\/task(@\w+)?\s*/i, '').trim();
+    if (!raw) {
+        await ctx.reply(
+            'Использование: /task <название задачи>\n\n'
+            + 'Аварийная команда — создаёт задачу в Plane напрямую, без AI и без подтверждения.\n'
+            + 'Полезно, если Claude временно недоступен.',
+        );
+        return;
+    }
+
+    const title = raw.slice(0, 200);
+    const issue = await createIssue(title, '', 'medium', null);
+    if (!issue) {
+        await ctx.reply('❌ Не удалось создать задачу (Plane API не ответил или не настроен).');
+        logger.warn({ userId, title }, 'fallback /task — plane returned null');
+        return;
+    }
+
+    try {
+        db.prepare(
+            'INSERT INTO tasks (tg_user_id, plane_issue_key, created_at) VALUES (?, ?, ?)',
+        ).run(userId, issue.id || issue.sequence_id || '', new Date().toISOString());
+    } catch (err) {
+        logger.warn({ err: err.message }, 'failed to insert into tasks table from /task');
+    }
+
+    const baseUrl = process.env.PLANE_URL?.replace(/\/$/, '');
+    const slug = process.env.PLANE_WORKSPACE_SLUG;
+    const projectId = process.env.PLANE_PROJECT_ID;
+    const url = baseUrl && slug && projectId
+        ? `\n${baseUrl}/${slug}/projects/${projectId}/issues/${issue.id}`
+        : '';
+    await ctx.reply(`✅ Создано: ${issue.name || title}${url}`);
+    logger.info({ userId, title }, 'task created via fallback /task');
+}
+
 // =================== /search — поиск по диалогам, задачам, заметкам ===================
 
 function truncate(text, max = 80) {
@@ -884,6 +951,7 @@ bot.command('set_alert', (ctx) => safeCmd(ctx, cmdSetAlert));
 bot.command('monitor',   (ctx) => safeCmd(ctx, cmdMonitor));
 bot.command('todo',      (ctx) => safeCmd(ctx, cmdTodo));
 bot.command('remind',    (ctx) => safeCmd(ctx, cmdRemind));
+bot.command('task',      (ctx) => safeCmd(ctx, cmdTask));
 bot.command('note',      (ctx) => safeCmd(ctx, cmdNote));
 bot.command('translate', (ctx) => safeCmd(ctx, cmdTranslate));
 bot.command('summarize', (ctx) => safeCmd(ctx, cmdSummarize));
@@ -903,38 +971,42 @@ const BUTTON_HANDLERS = {
     'ℹ️ Помощь': cmdHelp,
 };
 
-// =================== Подтверждение создания задач ===================
-bot.action('confirm_create', async (ctx) => {
+// =================== Подтверждение создания задач (persisted в pending_tasks) ===================
+bot.action(/^confirm_create:(.+)$/, async (ctx) => {
     try {
-        const userId = ctx.from.id;
-        const plan = pendingTasks.get(userId);
+        const token = ctx.match[1];
+        const pending = getPendingTask(token);
 
-        // Проверка TTL: задача могла протухнуть.
-        if (!plan || Date.now() - plan.createdAt > PENDING_TTL_MS) {
-            pendingTasks.delete(userId);
-            await ctx.answerCbQuery('Задача неактуальна');
+        if (!pending) {
+            await ctx.answerCbQuery('Черновик устарел');
+            await ctx.editMessageText('⏱ Черновик устарел или уже обработан.');
             return;
         }
-        pendingTasks.delete(userId);
+        if (pending.userId !== ctx.from.id) {
+            await ctx.answerCbQuery('Это не ваш черновик');
+            return;
+        }
+
         await ctx.answerCbQuery('Создаю...');
+        const { plan } = pending;
+        deletePendingTask(token);
 
         const assigneeId = plan.assignee ? await resolveAssignee(plan.assignee) : null;
         const created = await createIssue(plan.title, plan.description, plan.priority, assigneeId);
 
         if (!created) {
-            await ctx.editMessageText('❌ Plane API не ответил — задача не создана. Проверьте логи и .env.');
+            await ctx.editMessageText('❌ Plane API не ответил — задача не создана.');
             return;
         }
 
         try {
             db.prepare(
                 'INSERT INTO tasks (tg_user_id, plane_issue_key, created_at) VALUES (?, ?, ?)',
-            ).run(userId, created.id || created.sequence_id || '', new Date().toISOString());
-        } catch {
-            /* таблицы tasks нет — не критично */
+            ).run(pending.userId, created.id || created.sequence_id || '', new Date().toISOString());
+        } catch (err) {
+            logger.warn({ err: err.message }, 'failed to insert into tasks table');
         }
 
-        // Показываем ссылку только если все переменные Plane заданы.
         const baseUrl = process.env.PLANE_URL?.replace(/\/$/, '');
         const slug = process.env.PLANE_WORKSPACE_SLUG;
         const projectId = process.env.PLANE_PROJECT_ID;
@@ -942,48 +1014,82 @@ bot.action('confirm_create', async (ctx) => {
             ? `\n${baseUrl}/${slug}/projects/${projectId}/issues/${created.id}`
             : '';
         await ctx.editMessageText(`✅ Создано: ${created.name}${url}`);
+        logger.info({ userId: pending.userId, title: plan.title }, 'task created from preview');
     } catch (err) {
-        console.error('[confirm_create] error:', err.message);
+        logger.error({ err: err.message }, 'confirm_create handler error');
     }
 });
 
-bot.action('cancel_create', async (ctx) => {
-    pendingTasks.delete(ctx.from.id);
-    await ctx.answerCbQuery('Отменено');
-    await ctx.editMessageText('❌ Создание задачи отменено.');
+bot.action(/^cancel_create:(.+)$/, async (ctx) => {
+    try {
+        const token = ctx.match[1];
+        const pending = getPendingTask(token);
+        if (pending && pending.userId === ctx.from.id) {
+            deletePendingTask(token);
+        }
+        await ctx.answerCbQuery('Отменено');
+        await ctx.editMessageText('❌ Создание задачи отменено.');
+    } catch (err) {
+        logger.error({ err: err.message }, 'cancel_create handler error');
+    }
 });
 
 // =================== Универсальная обработка сообщения (текст ИЛИ транскрипт голосового) ===================
 async function processUserMessage(ctx, rawMessage) {
-    const chatId = ctx.chat.id;
+    const userId = ctx.from.id; // только приватные чаты → chat.id === from.id
     const message = rawMessage.slice(0, MAX_USER_MESSAGE_LEN);
 
-    // 1. Если совпало с подписью кнопки меню — выполняем команду напрямую.
+    // 1. Если совпало с подписью кнопки меню — выполняем команду напрямую (rate-limit не тратим).
     const handler = BUTTON_HANDLERS[message];
     if (handler) {
         await handler(ctx);
         return;
     }
 
-    // 2. Обычное сообщение → понимаем через Claude.
-    saveMessage(chatId, 'user', message);
-
-    const result = await analyzeTask(message, loadHistory(chatId, HISTORY_LIMIT));
-    if (!result) {
-        await ctx.reply('Claude API не ответил. Проверьте ANTHROPIC_API_KEY и логи.');
+    // 2. Rate limit (счётчик только для реальных запросов к Claude).
+    const rl = checkAndRecordRateLimit(userId, RATE_LIMIT_PER_HOUR);
+    if (!rl.allowed) {
+        logger.warn({ userId, count: rl.count, max: rl.max }, 'rate limit hit');
+        await ctx.reply(
+            `⏱ Слишком много запросов. Лимит: ${rl.max} в час. Попробуйте позже.`,
+        );
         return;
     }
-    saveMessage(chatId, 'assistant', result.reply || '');
+
+    // 3. Обычное сообщение → понимаем через Claude.
+    saveMessage(userId, 'user', message);
+
+    const result = await analyzeTask(message, loadHistory(userId, HISTORY_LIMIT));
+    if (!result) {
+        logger.warn({ userId }, 'claude unavailable, suggested fallback');
+        await ctx.reply(
+            'AI временно недоступен. Создать задачу можно командой:\n`/task <название>`\n\nПример: `/task подготовить отчёт`',
+            { parse_mode: 'Markdown' },
+        );
+        return;
+    }
+    saveMessage(userId, 'assistant', result.reply || '');
 
     if (result.action === 'create_task') {
-        pendingTasks.set(ctx.from.id, {
+        // Защита от дублирования черновиков
+        const existingToken = hasActivePendingTask(userId);
+        if (existingToken) {
+            await ctx.reply(
+                'У вас уже есть незавершённый черновик задачи. Подтвердите или отмените его, прежде чем создавать новый.',
+            );
+            return;
+        }
+
+        const plan = {
             title: result.title,
             description: result.description,
             assignee: result.assignee,
             priority: result.priority || 'medium',
             dueDate: result.dueDate,
-            createdAt: Date.now(),
-        });
+        };
+        const token = randomBytes(8).toString('hex');
+        savePendingTask(token, userId, ctx.chat.id, plan);
+
         const preview = [
             'Создать задачу?',
             `📋 ${result.title}`,
@@ -994,8 +1100,8 @@ async function processUserMessage(ctx, rawMessage) {
         ].filter(Boolean).join('\n');
         const keyboard = Markup.inlineKeyboard([
             [
-                Markup.button.callback('✅ Создать', 'confirm_create'),
-                Markup.button.callback('❌ Отмена', 'cancel_create'),
+                Markup.button.callback('✅ Создать', `confirm_create:${token}`),
+                Markup.button.callback('❌ Отмена', `cancel_create:${token}`),
             ],
         ]);
         await ctx.reply(preview, keyboard);
@@ -1038,7 +1144,7 @@ async function handleVoice(ctx) {
         const link = await bot.telegram.getFileLink(fileId);
         transcript = await transcribeAudio(link.toString());
     } catch (err) {
-        console.error('[voice]', err.message);
+        logger.error({ err: err.message }, '[voice] transcription failed');
         await ctx.reply(`❌ Не получилось распознать голосовое: ${err.message}`);
         return;
     }
@@ -1075,7 +1181,7 @@ async function handleVoice(ctx) {
             const audio = await synthesizeVoice(lastTextReply);
             await ctx.replyWithVoice({ source: audio });
         } catch (err) {
-            console.error('[tts]', err.message);
+            logger.error({ err: err.message }, '[tts] synthesis failed');
             await origReply(`⚠️ Голосовой ответ не сгенерировался: ${err.message}`);
         }
     }
@@ -1175,7 +1281,7 @@ async function handleWebhook(req, res) {
             const text = formatWebhook(payload, req.headers);
             const chatId = getAlertChatId() || process.env.ALERT_CHAT_ID;
             if (!chatId) {
-                console.warn('[webhook] не задан чат — выполните /set_alert в Telegram');
+                logger.warn('[webhook] no alert chat — run /set_alert in Telegram');
                 res.writeHead(503).end('no alert chat — run /set_alert in Telegram');
                 return;
             }
@@ -1186,16 +1292,52 @@ async function handleWebhook(req, res) {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: true }));
         } catch (err) {
-            console.error('[webhook] error:', err.message);
+            logger.error({ err: err.message }, '[webhook] handler error');
             res.writeHead(500).end(`error: ${err.message}`);
         }
     });
 }
 
+// Кэш результата getMe(), чтобы не дёргать Telegram API на каждый /health.
+let _telegramHealthCache = { ok: false, checkedAt: 0 };
+const TELEGRAM_HEALTH_TTL = 30_000;
+
+async function handleHealth(req, res) {
+    const checks = {
+        db: false,
+        telegram: false,
+        time: new Date().toISOString(),
+    };
+
+    try {
+        db.prepare('SELECT 1').get();
+        checks.db = true;
+    } catch (err) {
+        logger.error({ err: err.message }, 'health: db check failed');
+    }
+
+    const now = Date.now();
+    if (now - _telegramHealthCache.checkedAt < TELEGRAM_HEALTH_TTL) {
+        checks.telegram = _telegramHealthCache.ok;
+    } else {
+        try {
+            await bot.telegram.getMe();
+            _telegramHealthCache = { ok: true, checkedAt: now };
+            checks.telegram = true;
+        } catch (err) {
+            _telegramHealthCache = { ok: false, checkedAt: now };
+            logger.error({ err: err.message }, 'health: telegram check failed');
+        }
+    }
+
+    const ok = checks.db && checks.telegram;
+    res.writeHead(ok ? 200 : 503, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: ok ? 'ok' : 'degraded', service: 'scrum-plane-bot', checks }));
+}
+
 const httpServer = http.createServer((req, res) => {
-    if (req.url === '/health') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'ok', service: 'scrum-plane-bot' }));
+    if (req.method === 'GET' && req.url === '/health') {
+        handleHealth(req, res);
         return;
     }
     if (req.method === 'POST' && req.url.startsWith('/webhook/')) {
@@ -1204,7 +1346,7 @@ const httpServer = http.createServer((req, res) => {
     }
     res.writeHead(404).end();
 }).listen(HEALTH_PORT, () => {
-    console.log(`HTTP на :${HEALTH_PORT} (endpoints: /health, /webhook/<secret>)`);
+    logger.info({ port: HEALTH_PORT }, 'HTTP server started (/health, /webhook/<secret>)');
 });
 
 // =================== Cron напоминаний ===================
@@ -1214,7 +1356,7 @@ cron.schedule('* * * * *', async () => {
     try {
         due = listPendingReminders();
     } catch (err) {
-        console.error('[reminder] чтение из БД упало:', err.message);
+        logger.error({ err: err.message }, 'reminder DB read failed');
         return;
     }
     for (const r of due) {
@@ -1222,21 +1364,32 @@ cron.schedule('* * * * *', async () => {
             await bot.telegram.sendMessage(r.chat_id, `⏰ Напоминание #${r.id}:\n${r.text}`);
             markReminderSent(r.id);
         } catch (err) {
-            console.error(`[reminder] не отправил #${r.id}:`, err.message);
+            logger.error({ err: err.message, reminderId: r.id }, 'reminder send failed');
         }
+    }
+});
+
+// =================== Cron: чистка старой истории диалогов ===================
+// Раз в сутки в 03:00 оставляем последние 50 сообщений на пользователя, остальное удаляем.
+cron.schedule('0 3 * * *', () => {
+    try {
+        const deleted = cleanupDialogHistory(50);
+        if (deleted > 0) logger.info({ deleted }, 'dialog history cleanup');
+    } catch (err) {
+        logger.error({ err: err.message }, 'dialog history cleanup failed');
     }
 });
 
 // =================== Старт ===================
 startScheduler(bot);
 bot.launch().catch((err) => {
-    console.error('[telegraf] launch error:', err.message);
+    logger.error({ err: err.message }, '[telegraf] launch error');
     // HTTP-сервер всё равно живёт — Railway healthcheck не упадёт зря.
 });
-console.log('Бот запущен');
+logger.info('bot started');
 
 function gracefulShutdown(signal) {
-    console.log(`[shutdown] получен сигнал ${signal}`);
+    logger.info({ signal }, '[shutdown] received signal');
     bot.stop(signal);
     httpServer.close();
 }

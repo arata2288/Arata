@@ -6,10 +6,79 @@
 import Anthropic from '@anthropic-ai/sdk';
 import dotenv from 'dotenv';
 
+import { logger } from './logger.js';
+
 dotenv.config();
 
 const MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-5';
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+// =================== Валидация ответа Claude ===================
+const VALID_ACTIONS = ['create_task', 'list_tasks', 'update_task', 'question'];
+const VALID_PRIORITIES = ['urgent', 'high', 'medium', 'low', 'none'];
+const MAX_TITLE_LEN = 200;
+const MAX_DESCRIPTION_LEN = 4000;
+const MAX_ASSIGNEE_LEN = 100;
+const MAX_REPLY_LEN = 2000;
+
+function fallbackQuestion(reply = 'Не понял запрос, можешь переформулировать?') {
+    return {
+        action: 'question',
+        title: null, description: null, assignee: null,
+        priority: 'medium', dueDate: null,
+        reply,
+    };
+}
+
+function validateClaudeResponse(r) {
+    if (!r || typeof r !== 'object') return fallbackQuestion();
+    if (!VALID_ACTIONS.includes(r.action)) return fallbackQuestion();
+
+    if (r.action === 'question') {
+        return {
+            ...fallbackQuestion(),
+            reply: typeof r.reply === 'string' ? r.reply.slice(0, MAX_REPLY_LEN) : 'Уточните, пожалуйста.',
+        };
+    }
+
+    if (r.action === 'create_task') {
+        if (!r.title || typeof r.title !== 'string' || r.title.trim().length === 0) {
+            return fallbackQuestion('Не понял, какую задачу создать. Уточните название.');
+        }
+        return {
+            action: 'create_task',
+            title: r.title.trim().slice(0, MAX_TITLE_LEN),
+            description: typeof r.description === 'string' ? r.description.slice(0, MAX_DESCRIPTION_LEN) : '',
+            assignee: typeof r.assignee === 'string' ? r.assignee.slice(0, MAX_ASSIGNEE_LEN) : null,
+            priority: VALID_PRIORITIES.includes(r.priority) ? r.priority : 'medium',
+            dueDate: typeof r.dueDate === 'string' ? r.dueDate.slice(0, 30) : null,
+            reply: typeof r.reply === 'string' ? r.reply.slice(0, MAX_REPLY_LEN) : '',
+        };
+    }
+
+    if (r.action === 'list_tasks') {
+        return {
+            action: 'list_tasks',
+            title: null, description: null, assignee: null,
+            priority: 'medium', dueDate: null,
+            reply: typeof r.reply === 'string' ? r.reply.slice(0, MAX_REPLY_LEN) : '',
+        };
+    }
+
+    if (r.action === 'update_task') {
+        return {
+            action: 'update_task',
+            title: typeof r.title === 'string' ? r.title.slice(0, MAX_TITLE_LEN) : null,
+            description: typeof r.description === 'string' ? r.description.slice(0, MAX_DESCRIPTION_LEN) : null,
+            assignee: typeof r.assignee === 'string' ? r.assignee.slice(0, MAX_ASSIGNEE_LEN) : null,
+            priority: VALID_PRIORITIES.includes(r.priority) ? r.priority : 'medium',
+            dueDate: typeof r.dueDate === 'string' ? r.dueDate.slice(0, 30) : null,
+            reply: typeof r.reply === 'string' ? r.reply.slice(0, MAX_REPLY_LEN) : '',
+        };
+    }
+
+    return fallbackQuestion();
+}
 
 const TASK_SYSTEM_PROMPT = `Ты — универсальный AI-помощник на русском языке, работаешь в Telegram-боте.
 
@@ -71,28 +140,22 @@ export async function analyzeTask(userMessage, history = []) {
         const text = response.content?.[0]?.text?.trim();
         if (!text) return null;
 
+        let parsed;
         try {
-            return JSON.parse(text);
-        } catch (err) {
-            console.error('[claude] Ответ не валидный JSON:', text.slice(0, 300));
-            return {
-                action: 'question',
-                title: null, description: null, assignee: null,
-                priority: 'medium', dueDate: null,
-                reply: 'Не смог распарсить ответ. Попробуйте переформулировать запрос.',
-            };
+            parsed = JSON.parse(text);
+        } catch {
+            logger.warn({ snippet: text.slice(0, 200) }, '[claude] invalid JSON response');
+            return fallbackQuestion('Не смог распарсить ответ. Попробуйте переформулировать запрос.');
         }
+        return validateClaudeResponse(parsed);
     } catch (err) {
-        console.error(
-            '[claude] analyzeTask error:',
-            JSON.stringify({
-                name: err.name,
-                message: err.message,
-                status: err.status,
-                cause_code: err.cause?.code,
-                cause_name: err.cause?.name,
-            }),
-        );
+        logger.error({
+            name: err.name,
+            message: err.message,
+            status: err.status,
+            cause_code: err.cause?.code,
+            cause_name: err.cause?.name,
+        }, '[claude] analyzeTask error');
         return null;
     }
 }
@@ -112,10 +175,7 @@ async function _simpleCall(systemPrompt, userMessage, maxTokens = 1024) {
         });
         return response.content?.[0]?.text?.trim() || null;
     } catch (err) {
-        console.error(
-            '[claude] simple call error:',
-            JSON.stringify({ name: err.name, message: err.message, status: err.status }),
-        );
+        logger.error({ name: err.name, message: err.message, status: err.status }, '[claude] simple call error');
         return null;
     }
 }
@@ -160,16 +220,13 @@ export async function analyzeError(serviceName, httpStatus, responseTime) {
         });
         return response.content?.[0]?.text?.trim() || null;
     } catch (err) {
-        console.error(
-            '[claude] analyzeError error:',
-            JSON.stringify({
-                name: err.name,
-                message: err.message,
-                status: err.status,
-                cause_code: err.cause?.code,
-                cause_name: err.cause?.name,
-            }),
-        );
+        logger.error({
+            name: err.name,
+            message: err.message,
+            status: err.status,
+            cause_code: err.cause?.code,
+            cause_name: err.cause?.name,
+        }, '[claude] analyzeError error');
         return null;
     }
 }

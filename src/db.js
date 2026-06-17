@@ -81,11 +81,32 @@ export function ensureSchema() {
             created_at TEXT    NOT NULL
         );
 
-        CREATE INDEX IF NOT EXISTS idx_tasks_user     ON tasks(tg_user_id);
-        CREATE INDEX IF NOT EXISTS idx_dialog_user    ON dialog_history(tg_user_id);
-        CREATE INDEX IF NOT EXISTS idx_todos_user     ON todos(tg_user_id, status);
-        CREATE INDEX IF NOT EXISTS idx_reminders_due  ON reminders(sent, remind_at);
-        CREATE INDEX IF NOT EXISTS idx_notes_user     ON notes(tg_user_id);
+        CREATE TABLE IF NOT EXISTS rate_limit (
+            tg_user_id INTEGER NOT NULL,
+            request_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS service_status (
+            name        TEXT PRIMARY KEY,
+            last_status TEXT NOT NULL,
+            updated_at  TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS pending_tasks (
+            token       TEXT PRIMARY KEY,
+            tg_user_id  INTEGER NOT NULL,
+            chat_id     INTEGER NOT NULL,
+            plan_json   TEXT    NOT NULL,
+            created_at  INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tasks_user      ON tasks(tg_user_id);
+        CREATE INDEX IF NOT EXISTS idx_dialog_user     ON dialog_history(tg_user_id);
+        CREATE INDEX IF NOT EXISTS idx_todos_user      ON todos(tg_user_id, status);
+        CREATE INDEX IF NOT EXISTS idx_reminders_due   ON reminders(sent, remind_at);
+        CREATE INDEX IF NOT EXISTS idx_notes_user      ON notes(tg_user_id);
+        CREATE INDEX IF NOT EXISTS idx_rl_user_time    ON rate_limit(tg_user_id, request_at);
+        CREATE INDEX IF NOT EXISTS idx_pending_user    ON pending_tasks(tg_user_id);
     `);
 }
 
@@ -348,4 +369,98 @@ export function stats() {
             (SELECT created_at FROM dialog_history ORDER BY id DESC LIMIT 1)  AS last_message_at
         FROM dialog_history
     `).get();
+}
+
+// ============================== Rate limit ==============================
+
+/**
+ * Чекнуть и записать запрос. Возвращает {allowed, count, max}.
+ * Если allowed=false — лимит превышен, запись НЕ создаём.
+ */
+export function checkAndRecordRateLimit(userId, maxPerHour = 30) {
+    const now = Date.now();
+    const hourAgo = now - 3_600_000;
+    db.prepare('DELETE FROM rate_limit WHERE request_at < ?').run(hourAgo);
+    const { c } = db.prepare(
+        'SELECT COUNT(*) AS c FROM rate_limit WHERE tg_user_id = ? AND request_at > ?',
+    ).get(userId, hourAgo);
+    if (c >= maxPerHour) return { allowed: false, count: c, max: maxPerHour };
+    db.prepare('INSERT INTO rate_limit (tg_user_id, request_at) VALUES (?, ?)').run(userId, now);
+    return { allowed: true, count: c + 1, max: maxPerHour };
+}
+
+// ============================== Service status ==============================
+
+export function getServiceStatus(name) {
+    const row = db.prepare('SELECT last_status FROM service_status WHERE name = ?').get(name);
+    return row ? row.last_status : null;
+}
+
+export function setServiceStatus(name, status) {
+    db.prepare(`
+        INSERT INTO service_status (name, last_status, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(name) DO UPDATE SET
+            last_status = excluded.last_status,
+            updated_at  = excluded.updated_at
+    `).run(name, status, new Date().toISOString());
+}
+
+// ============================== Pending tasks (persisted) ==============================
+
+export function savePendingTask(token, userId, chatId, plan) {
+    db.prepare(`
+        INSERT INTO pending_tasks (token, tg_user_id, chat_id, plan_json, created_at)
+        VALUES (?, ?, ?, ?, ?)
+    `).run(token, userId, chatId, JSON.stringify(plan), Date.now());
+}
+
+export function getPendingTask(token) {
+    const row = db.prepare('SELECT * FROM pending_tasks WHERE token = ?').get(token);
+    if (!row) return null;
+    return {
+        token: row.token,
+        userId: row.tg_user_id,
+        chatId: row.chat_id,
+        plan: JSON.parse(row.plan_json),
+        createdAt: row.created_at,
+    };
+}
+
+export function deletePendingTask(token) {
+    return db.prepare('DELETE FROM pending_tasks WHERE token = ?').run(token).changes;
+}
+
+export function cleanupExpiredPendingTasks(ttlMs = 30 * 60_000) {
+    const cutoff = Date.now() - ttlMs;
+    return db.prepare('DELETE FROM pending_tasks WHERE created_at < ?').run(cutoff).changes;
+}
+
+export function hasActivePendingTask(userId, ttlMs = 30 * 60_000) {
+    const cutoff = Date.now() - ttlMs;
+    const row = db.prepare(
+        `SELECT token FROM pending_tasks
+         WHERE tg_user_id = ? AND created_at > ?
+         LIMIT 1`,
+    ).get(userId, cutoff);
+    return row ? row.token : null;
+}
+
+// ============================== dialog_history cleanup ==============================
+
+/**
+ * Оставить не больше keepLastPerUser сообщений на пользователя — старые удалить.
+ * Возвращает число удалённых строк.
+ */
+export function cleanupDialogHistory(keepLastPerUser = 50) {
+    return db.prepare(`
+        DELETE FROM dialog_history
+        WHERE id NOT IN (
+            SELECT id FROM dialog_history d1
+            WHERE (
+                SELECT COUNT(*) FROM dialog_history d2
+                WHERE d2.tg_user_id = d1.tg_user_id AND d2.id >= d1.id
+            ) <= ?
+        )
+    `).run(keepLastPerUser).changes;
 }

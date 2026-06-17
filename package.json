@@ -16,6 +16,7 @@
     "better-sqlite3": "^11.5.0",
     "dotenv": "^16.4.5",
     "node-cron": "^3.0.3",
+    "pino": "^10.3.1",
     "telegraf": "^4.16.3"
   }
 }

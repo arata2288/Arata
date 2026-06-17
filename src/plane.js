@@ -4,6 +4,7 @@
 // При любой ошибке логируем и возвращаем null — вызывающий код решает, что делать.
 
 import dotenv from 'dotenv';
+import { logger } from './logger.js';
 dotenv.config();
 
 const {
@@ -15,7 +16,7 @@ const {
 
 function _projectPath() {
     if (!PLANE_URL || !PLANE_WORKSPACE_SLUG || !PLANE_PROJECT_ID) {
-        console.warn('[plane] не заданы PLANE_URL / WORKSPACE_SLUG / PROJECT_ID — функция вернёт null');
+        logger.warn('[plane] PLANE_URL/WORKSPACE_SLUG/PROJECT_ID not set — returning null');
         return null;
     }
     return `${PLANE_URL.replace(/\/$/, '')}/api/v1/workspaces/${PLANE_WORKSPACE_SLUG}/projects/${PLANE_PROJECT_ID}`;
@@ -34,14 +35,14 @@ async function _request(method, url, body = null) {
 
         if (!response.ok) {
             const text = await response.text();
-            console.error(`[plane] ${method} ${url} → HTTP ${response.status}: ${text.slice(0, 300)}`);
+            logger.error({ method, url, status: response.status, body: text.slice(0, 300) }, '[plane] http error');
             return null;
         }
         // DELETE может вернуть 204 No Content
         if (response.status === 204) return true;
         return await response.json();
     } catch (err) {
-        console.error(`[plane] ${method} ${url} →`, err.message);
+        logger.error({ method, url, err: err.message }, '[plane] fetch error');
         return null;
     }
 }
@@ -115,7 +116,7 @@ export async function resolveAssignee(name) {
     });
 
     if (!found) {
-        console.warn(`[plane] resolveAssignee: пользователь «${name}» не найден среди ${members.length} участников`);
+        logger.warn({ name, totalMembers: members.length }, '[plane] resolveAssignee: not found');
         return null;
     }
     const user = found.member || found;
